@@ -1,6 +1,10 @@
+import hashlib
+from io import BytesIO
+
 import pandas as pd
 import plotly.express as px
 import streamlit as st
+
 
 st.set_page_config(
     page_title="M&E Data Analysis",
@@ -8,590 +12,30 @@ st.set_page_config(
     layout="wide",
 )
 
-st.title("M&E Data Analysis")
-st.write(
-    "Upload Excel or CSV data. Analyse one sheet or connect "
-    "two sheets using a shared identifier."
-)
 
+# ===========================
+# HELPER FUNCTIONS
+# ===========================
 
 def prepare_sheet(frame):
-    """Clean column names and remove completely empty rows."""
     frame = frame.copy()
-    frame.columns = [
-        str(column).strip()
-        for column in frame.columns
-    ]
-    frame = frame.dropna(how="all").reset_index(drop=True)
+    frame.columns = [str(column).strip() for column in frame.columns]
 
     if frame.columns.duplicated().any():
-        st.error(
-            "Duplicate column names found. "
-            "Rename the duplicate columns in your file."
-        )
-        st.stop()
+        raise ValueError("Column names must be unique.")
 
-    return frame
+    if len(frame.columns) == 0:
+        raise ValueError("No columns found. Check the header row.")
+
+    return frame.dropna(how="all").reset_index(drop=True)
 
 
 def normalise_uid(series):
-    """
-    Convert identifiers to trimmed text.
-    Blank identifiers remain missing, so they cannot match.
-    """
     values = series.astype("string").str.strip()
     return values.mask(values.eq(""))
 
 
-uploaded_file = st.file_uploader(
-    "Upload an Excel or CSV file",
-    type=["xlsx", "csv"],
-)
-
-if uploaded_file is None:
-    st.info("Upload a file to start.")
-    st.stop()
-
-try:
-    if uploaded_file.name.lower().endswith(".csv"):
-        df = prepare_sheet(
-            pd.read_csv(uploaded_file, dtype=object)
-        )
-
-    else:
-        workbook = pd.ExcelFile(uploaded_file)
-
-        mode = st.radio(
-            "How would you like to use this workbook?",
-            (
-                ["Analyse one sheet", "Connect two sheets"]
-                if len(workbook.sheet_names) >= 2
-                else ["Analyse one sheet"]
-            ),
-            horizontal=True,
-        )
-
-        if mode == "Analyse one sheet":
-            sheet_name = st.selectbox(
-                "Select sheet",
-                workbook.sheet_names,
-            )
-
-            header_row = st.number_input(
-                "Row containing column names",
-                min_value=1,
-                value=1,
-                step=1,
-                key="single_header",
-            )
-
-            df = prepare_sheet(
-                pd.read_excel(
-                    workbook,
-                    sheet_name=sheet_name,
-                    header=header_row - 1,
-                    dtype=object,
-                )
-            )
-
-        else:
-            first, second = st.columns(2)
-
-            with first:
-                sheet_a = st.selectbox(
-                    "First sheet: main records",
-                    workbook.sheet_names,
-                    key="sheet_a",
-                )
-                header_a = st.number_input(
-                    "Header row in first sheet",
-                    min_value=1,
-                    value=1,
-                    step=1,
-                    key="header_a",
-                )
-
-            with second:
-                sheet_b = st.selectbox(
-                    "Second sheet: linked records",
-                    [
-                        name for name in workbook.sheet_names
-                        if name != sheet_a
-                    ],
-                    key="sheet_b",
-                )
-                header_b = st.number_input(
-                    "Header row in second sheet",
-                    min_value=1,
-                    value=1,
-                    step=1,
-                    key="header_b",
-                )
-
-            data_a = prepare_sheet(
-                pd.read_excel(
-                    workbook,
-                    sheet_name=sheet_a,
-                    header=header_a - 1,
-                    dtype=object,
-                )
-            )
-            data_b = prepare_sheet(
-                pd.read_excel(
-                    workbook,
-                    sheet_name=sheet_b,
-                    header=header_b - 1,
-                    dtype=object,
-                )
-            )
-
-            if data_a.empty or data_b.empty:
-                st.warning(
-                    "Both selected sheets must contain data."
-                )
-                st.stop()
-
-            first, second = st.columns(2)
-
-            with first:
-                uid_a = st.selectbox(
-                    "UID column in first sheet",
-                    list(data_a.columns),
-                    key="uid_a",
-                )
-
-            with second:
-                uid_b = st.selectbox(
-                    "UID column in second sheet",
-                    list(data_b.columns),
-                    key="uid_b",
-                )
-
-            st.caption(
-                "Use a stable patient ID where possible. "
-                "Names can be shared by different people. "
-                "UID matching is exact after trimming spaces."
-            )
-
-            join_choice = st.selectbox(
-                "Which records should be included?",
-                [
-                    "All records from first sheet",
-                    "Only records matched in both sheets",
-                ],
-            )
-
-            # Prefix columns so their source remains clear.
-            left = data_a.add_prefix(f"{sheet_a} | ")
-            right = data_b.add_prefix(f"{sheet_b} | ")
-
-            # Find an internal key name that cannot overwrite
-            # any source column.
-            join_key = "__link_uid"
-            while join_key in left.columns or join_key in right.columns:
-                join_key += "_"
-
-            left[join_key] = normalise_uid(data_a[uid_a])
-            right[join_key] = normalise_uid(data_b[uid_b])
-
-            # Show duplicate UIDs before removing them.
-            duplicate_tables = []
-
-            for source_name, source_data, uid_column in [
-                (sheet_a, data_a, uid_a),
-                (sheet_b, data_b, uid_b),
-            ]:
-                normalised_keys = normalise_uid(
-                    source_data[uid_column]
-                )
-
-                duplicate_mask = (
-                    normalised_keys.notna()
-                    & normalised_keys.duplicated(keep=False)
-                )
-
-                if duplicate_mask.any():
-                    duplicate_rows = source_data.loc[
-                        duplicate_mask
-                    ].copy()
-
-                    # Add review information without overwriting
-                    # any original source column.
-                    review_info = pd.DataFrame(
-                        {
-                            "Source sheet": source_name,
-                            "UID used for matching": (
-                                normalised_keys.loc[
-                                    duplicate_mask
-                                ]
-                            ),
-                            "Action": [
-                                (
-                                    "Keep first occurrence"
-                                    if not is_repeat
-                                    else "Exclude from analysis"
-                                )
-                                for is_repeat in (
-                                    normalised_keys
-                                    .duplicated(keep="first")
-                                    .loc[duplicate_mask]
-                                )
-                            ],
-                        },
-                        index=duplicate_rows.index,
-                    )
-
-                    duplicate_rows = duplicate_rows.add_prefix(
-                        "Source | "
-                    )
-
-                    duplicate_tables.append(
-                        pd.concat(
-                            [review_info, duplicate_rows],
-                            axis=1,
-                        )
-                    )
-
-            if duplicate_tables:
-                duplicate_report = pd.concat(
-                    duplicate_tables,
-                    ignore_index=True,
-                    sort=False,
-                )
-
-                st.warning(
-                    "Repeated UIDs found. The first occurrence "
-                    "of each UID in each sheet will be kept. "
-                    "Later occurrences will be excluded from "
-                    "all subsequent analysis."
-                )
-
-                with st.expander(
-                    "Review duplicated UIDs and source records",
-                    expanded=True,
-                ):
-                    st.dataframe(
-                        duplicate_report,
-                        use_container_width=True,
-                    )
-
-                    st.download_button(
-                        "Download duplicate UID report",
-                        data=duplicate_report.to_csv(
-                            index=False
-                        ).encode("utf-8"),
-                        file_name="duplicate_uid_report.csv",
-                        mime="text/csv",
-                    )
-
-            # Keep the first row for each non-missing UID.
-            # Rows with missing UIDs remain separate and
-            # will never match each other.
-            repeat_left = (
-                left[join_key].notna()
-                & left[join_key].duplicated(keep="first")
-            )
-
-            repeat_right = (
-                right[join_key].notna()
-                & right[join_key].duplicated(keep="first")
-            )
-
-            removed_left = int(repeat_left.sum())
-            removed_right = int(repeat_right.sum())
-
-            left = left.loc[~repeat_left].copy()
-            right = right.loc[~repeat_right].copy()
-
-            st.caption(
-                f"Duplicate rows excluded: "
-                f"{removed_left:,} from {sheet_a}; "
-                f"{removed_right:,} from {sheet_b}."
-            )
-            missing_a = int(left[join_key].isna().sum())
-            missing_b = int(right[join_key].isna().sum())
-
-            if missing_a or missing_b:
-                st.warning(
-                    f"Missing UIDs: {missing_a:,} in the first "
-                    f"sheet and {missing_b:,} in the second. "
-                    "Missing UIDs are never matched."
-                )
-
-            # Remove missing right-side keys to prevent pandas
-            # from matching missing identifiers with each other.
-            right = right[right[join_key].notna()].copy()
-
-            matched = left[join_key].isin(right[join_key])
-            matched_count = int(matched.sum())
-
-            st.info(
-                f"{matched_count:,} of {len(left):,} first-sheet "
-                "records have a matching UID in the second sheet."
-            )
-
-            how = (
-                "left"
-                if join_choice == "All records from first sheet"
-                else "inner"
-            )
-
-            df = left.merge(
-                right,
-                on=join_key,
-                how=how,
-                validate="many_to_one",
-            ).drop(columns=join_key)
-
-            st.caption(
-                "Each result row represents a first-sheet "
-                "record, with matching second-sheet information "
-                "attached. A second-sheet value may repeat "
-                "across several first-sheet records."
-            )
-
-except Exception as error:
-    st.error(f"Could not prepare the uploaded file: {error}")
-    st.stop()
-
-if df.empty:
-    st.warning("No data rows are available.")
-    st.stop()
-
-st.caption(
-    f"Before filtering: {len(df):,} rows | "
-    f"{len(df.columns):,} columns"
-)
-
-with st.expander("Preview data before filtering"):
-    st.dataframe(df.head(100), use_container_width=True)
-
-
-# ===========================
-# FILTERS
-# ===========================
-
-with st.sidebar:
-    st.header("Filter data")
-
-    st.subheader("Date range")
-
-    date_column = st.selectbox(
-        "Date column",
-        ["None"] + list(df.columns),
-        key="date_filter_column",
-        help=(
-            "Select a full date column for a date range. "
-            "For labels such as January or Quarter II, "
-            "use the value filters below."
-        ),
-    )
-
-    if date_column != "None":
-        date_format = st.selectbox(
-            "Date format",
-            [
-                "Automatic: day first",
-                "Automatic: month first",
-                "YYYY-MM-DD",
-                "DD/MM/YYYY",
-                "MM/DD/YYYY",
-            ],
-            key="date_filter_format",
-        )
-
-        explicit_formats = {
-            "YYYY-MM-DD": "%Y-%m-%d",
-            "DD/MM/YYYY": "%d/%m/%Y",
-            "MM/DD/YYYY": "%m/%d/%Y",
-        }
-
-        if date_format in explicit_formats:
-            parsed_dates = pd.to_datetime(
-                df[date_column],
-                format=explicit_formats[date_format],
-                errors="coerce",
-            )
-        else:
-            parsed_dates = pd.to_datetime(
-                df[date_column],
-                errors="coerce",
-                dayfirst=date_format == "Automatic: day first",
-            )
-
-        valid_dates = parsed_dates.dropna()
-
-        if valid_dates.empty:
-            st.warning(
-                "No valid dates found. Check the selected "
-                "column and date format."
-            )
-            st.stop()
-
-        earliest = valid_dates.min().date()
-        latest = valid_dates.max().date()
-
-        # A changed file/column/range gets a fresh date selector.
-        date_widget_key = (
-            f"range_{uploaded_file.name}_{date_column}_"
-            f"{date_format}_{earliest}_{latest}"
-        )
-
-        selected_range = st.date_input(
-            "Include dates from / to",
-            value=(earliest, latest),
-            min_value=earliest,
-            max_value=latest,
-            key=date_widget_key,
-        )
-
-        if len(selected_range) != 2:
-            st.info("Select both the start and end dates.")
-            st.stop()
-
-        start_date, end_date = selected_range
-
-        if start_date > end_date:
-            st.error("Start date must be before end date.")
-            st.stop()
-
-        missing_dates = int(parsed_dates.isna().sum())
-
-        if missing_dates:
-            st.caption(
-                f"{missing_dates:,} rows with missing or "
-                "invalid dates are excluded."
-            )
-
-        # Compare calendar dates so times on the end date
-        # remain included.
-        mask = (
-            parsed_dates.notna()
-            & (parsed_dates.dt.date >= start_date)
-            & (parsed_dates.dt.date <= end_date)
-        )
-        df = df.loc[mask].copy()
-
-    st.subheader("Value filters")
-
-    filter_columns = st.multiselect(
-        "Select columns to filter",
-        list(df.columns),
-        key="value_filter_columns",
-        help=(
-            "For example: township, gender, indicator, "
-            "year, reporting month or quarter."
-        ),
-    )
-
-    for position, column in enumerate(filter_columns):
-        values = df[column].astype("string")
-        options = sorted(values.dropna().unique().tolist())
-
-        chosen_values = st.multiselect(
-            f"Include values in {column}",
-            options,
-            default=options,
-            key=f"value_filter_{position}_{column}",
-        )
-
-        include_missing = st.checkbox(
-            f"Include missing values in {column}",
-            value=True,
-            key=f"missing_filter_{position}_{column}",
-        )
-
-        mask = values.isin(chosen_values)
-
-        if include_missing:
-            mask = mask | values.isna()
-
-        df = df.loc[mask].copy()
-
-if df.empty:
-    st.warning("No records match the selected filters.")
-    st.stop()
-
-st.success(f"Records after filtering: {len(df):,}")
-
-with st.expander("Preview filtered data"):
-    st.dataframe(df.head(100), use_container_width=True)
-
-st.download_button(
-    "Download filtered data",
-    data=df.to_csv(index=False).encode("utf-8"),
-    file_name="filtered_data.csv",
-    mime="text/csv",
-)
-
-st.subheader("Choose analysis settings")
-
-columns = list(df.columns)
-
-left, right = st.columns(2)
-
-with left:
-    actual_column = st.selectbox("Actual/result column", columns)
-    aggregation = st.selectbox(
-        "How should results be combined?",
-        ["Sum", "Mean"],
-        help=(
-            "Use Sum for additive counts or amounts. "
-            "Use Mean for comparable scores. "
-            "Rates may require a weighted calculation."
-        ),
-    )
-    period_column = st.selectbox(
-        "Date or period column",
-        ["None"] + columns,
-    )
-
-with right:
-    group_column = st.selectbox(
-        "Group column, such as township or gender",
-        ["None"] + columns,
-    )
-    target_column = st.selectbox(
-        "Target column",
-        ["None"] + [
-            column for column in columns
-            if column != actual_column
-        ],
-    )
-
-period_mode = "Keep labels"
-frequency = "Monthly"
-
-if period_column != "None":
-    period_mode = st.radio(
-        "Period format",
-        ["Keep labels", "Dates"],
-        horizontal=True,
-        help=(
-            "Keep labels for periods such as January or 2025 Q1. "
-            "Dates groups full dates into months, quarters or years."
-        ),
-    )
-
-    if period_mode == "Dates":
-        frequency = st.selectbox(
-            "Trend frequency",
-            ["Monthly", "Quarterly", "Yearly"],
-        )
-        day_first = st.checkbox(
-            "Dates use day/month/year",
-            value=True,
-        )
-
-st.caption(
-    "Select one indicator and unit before combining results. "
-    "Targets must be recorded at the same level as actual results; "
-    "a repeated annual target should not be summed across monthly rows."
-)
-
-
 def numeric_values(series):
-    """Convert numbers and comma-separated numeric text."""
     return pd.to_numeric(
         series.astype("string")
         .str.strip()
@@ -600,135 +44,664 @@ def numeric_values(series):
     )
 
 
-# Use a separate table to avoid overwriting source columns.
+def parse_dates(series, date_format):
+    formats = {
+        "YYYY-MM-DD": "%Y-%m-%d",
+        "DD/MM/YYYY": "%d/%m/%Y",
+        "MM/DD/YYYY": "%m/%d/%Y",
+    }
+
+    if date_format in formats:
+        return pd.to_datetime(
+            series,
+            format=formats[date_format],
+            errors="coerce",
+        )
+
+    return pd.to_datetime(
+        series,
+        format="mixed",
+        errors="coerce",
+        dayfirst=date_format == "Automatic: day first",
+    )
+
+
+def download_table(table, filename, label, key):
+    st.download_button(
+        label,
+        data=table.to_csv(index=False).encode("utf-8-sig"),
+        file_name=filename,
+        mime="text/csv",
+        key=key,
+    )
+
+
+def keep_first_uid(frame, uid_column, sheet_name, header_row):
+    """Report all repeated UID rows and retain the first."""
+    uid = normalise_uid(frame[uid_column])
+    repeated = uid.notna() & uid.duplicated(keep=False)
+    exclude = uid.notna() & uid.duplicated(keep="first")
+
+    report = pd.DataFrame()
+
+    if repeated.any():
+        # Original Excel row numbers are retained in prepare_sheet.
+        details = pd.DataFrame(
+            {
+                "Source sheet": sheet_name,
+                "Excel row": frame.index + header_row + 1,
+                "Matching UID": uid,
+                "Action": exclude.map({
+                    False: "Keep first occurrence",
+                    True: "Exclude from analysis",
+                }),
+            },
+            index=frame.index,
+        )
+
+        report = pd.concat(
+            [
+                details.loc[repeated],
+                frame.loc[repeated].add_prefix("Source | "),
+            ],
+            axis=1,
+        )
+
+    return frame.loc[~exclude].copy(), report, int(exclude.sum())
+
+
+def read_excel_sheet(content, sheet_name, header_row):
+    # Keep original data-row positions for duplicate review.
+    frame = pd.read_excel(
+        BytesIO(content),
+        sheet_name=sheet_name,
+        header=header_row - 1,
+        dtype=object,
+    )
+    frame.columns = [str(column).strip() for column in frame.columns]
+
+    if len(frame.columns) == 0 or frame.columns.duplicated().any():
+        raise ValueError("Check the header row and unique column names.")
+
+    return frame.dropna(how="all")
+
+
+def aggregate_table(table, dimensions, measures, method):
+    if dimensions:
+        grouped = table.groupby(dimensions, dropna=False, sort=False)[measures]
+        result = (
+            grouped.sum(min_count=1)
+            if method == "sum"
+            else grouped.mean()
+        )
+        return result.reset_index()
+
+    return pd.DataFrame({
+        column: [table[column].agg(method)]
+        for column in measures
+    })
+
+
+def sort_table(table, name_column, value_columns, key):
+    first, second = st.columns(2)
+
+    with first:
+        column = st.selectbox(
+            "Sort by",
+            [name_column] + value_columns,
+            key=f"{key}_column",
+        )
+
+    with second:
+        direction = st.selectbox(
+            "Sort direction",
+            ["Ascending", "Descending"],
+            key=f"{key}_direction",
+        )
+
+    if column == name_column:
+        # Case-insensitive alphabetical order.
+        return table.sort_values(
+            column,
+            ascending=direction == "Ascending",
+            key=lambda values: values.astype("string").str.casefold(),
+            kind="stable",
+            na_position="last",
+        ).reset_index(drop=True)
+
+    return table.sort_values(
+        column,
+        ascending=direction == "Ascending",
+        kind="stable",
+        na_position="last",
+    ).reset_index(drop=True)
+
+
+DATE_FORMATS = [
+    "Automatic: day first",
+    "Automatic: month first",
+    "YYYY-MM-DD",
+    "DD/MM/YYYY",
+    "MM/DD/YYYY",
+]
+
+
+# ===========================
+# UPLOAD AND SHEET SELECTION
+# ===========================
+
+st.title("M&E Data Analysis")
+st.write(
+    "Analyse trends, compare groups and calculate target gaps. "
+    "Connect two Excel sheets using a shared UID."
+)
+
+uploaded = st.file_uploader(
+    "Upload Excel or CSV",
+    type=["xlsx", "csv"],
+)
+
+if uploaded is None:
+    st.info("Upload a file to begin.")
+    st.stop()
+
+content = uploaded.getvalue()
+file_id = hashlib.sha256(content).hexdigest()[:12]
+
+# Reset settings when a different file is uploaded.
+if st.session_state.get("_current_file") != file_id:
+    for key in list(st.session_state):
+        if key.startswith("setting_"):
+            del st.session_state[key]
+    st.session_state["_current_file"] = file_id
+
+try:
+    if uploaded.name.lower().endswith(".csv"):
+        df = prepare_sheet(
+            pd.read_csv(BytesIO(content), dtype=object)
+        )
+    else:
+        workbook = pd.ExcelFile(BytesIO(content))
+        sheet_names = workbook.sheet_names
+
+        modes = ["Analyse one sheet"]
+        if len(sheet_names) >= 2:
+            modes.append("Connect two sheets")
+
+        mode = st.radio(
+            "Workbook analysis",
+            modes,
+            horizontal=True,
+            key="setting_mode",
+        )
+
+        if mode == "Analyse one sheet":
+            sheet_name = st.selectbox(
+                "Sheet",
+                sheet_names,
+                key="setting_sheet",
+            )
+            header_row = st.number_input(
+                "Header row",
+                min_value=1,
+                value=1,
+                step=1,
+                key="setting_header",
+            )
+            df = read_excel_sheet(content, sheet_name, header_row)
+
+        else:
+            first, second = st.columns(2)
+
+            with first:
+                sheet_a = st.selectbox(
+                    "First sheet",
+                    sheet_names,
+                    key="setting_sheet_a",
+                )
+                header_a = st.number_input(
+                    "First sheet header row",
+                    min_value=1,
+                    value=1,
+                    step=1,
+                    key="setting_header_a",
+                )
+
+            with second:
+                sheet_b = st.selectbox(
+                    "Second sheet",
+                    [name for name in sheet_names if name != sheet_a],
+                    key="setting_sheet_b",
+                )
+                header_b = st.number_input(
+                    "Second sheet header row",
+                    min_value=1,
+                    value=1,
+                    step=1,
+                    key="setting_header_b",
+                )
+
+            data_a = read_excel_sheet(content, sheet_a, header_a)
+            data_b = read_excel_sheet(content, sheet_b, header_b)
+
+            if data_a.empty or data_b.empty:
+                st.warning("Both selected sheets must contain records.")
+                st.stop()
+
+            first, second = st.columns(2)
+
+            with first:
+                uid_a = st.selectbox(
+                    "UID in first sheet",
+                    list(data_a.columns),
+                    key="setting_uid_a",
+                )
+
+            with second:
+                uid_b = st.selectbox(
+                    "UID in second sheet",
+                    list(data_b.columns),
+                    key="setting_uid_b",
+                )
+
+            st.caption(
+                "UIDs match exactly after trimming spaces. "
+                "Use patient ID where possible; names may not be unique."
+            )
+
+            join_choice = st.selectbox(
+                "Include records",
+                [
+                    "All records from first sheet",
+                    "Only records matched in both sheets",
+                ],
+                key="setting_join",
+            )
+
+            data_a, report_a, removed_a = keep_first_uid(
+                data_a, uid_a, sheet_a, header_a
+            )
+            data_b, report_b, removed_b = keep_first_uid(
+                data_b, uid_b, sheet_b, header_b
+            )
+
+            reports = [
+                report for report in [report_a, report_b]
+                if not report.empty
+            ]
+
+            if reports:
+                duplicate_report = pd.concat(
+                    reports, ignore_index=True, sort=False
+                )
+
+                st.warning(
+                    "Repeated UIDs found. Only the first record "
+                    "per UID in each sheet is used for analysis."
+                )
+
+                with st.expander("Duplicated UID records", expanded=True):
+                    st.dataframe(
+                        duplicate_report,
+                        use_container_width=True,
+                    )
+                    download_table(
+                        duplicate_report,
+                        "duplicate_uid_report.csv",
+                        "Download duplicate report",
+                        "duplicate_download",
+                    )
+
+            st.caption(
+                f"Duplicate rows excluded: {removed_a:,} from "
+                f"{sheet_a}; {removed_b:,} from {sheet_b}. "
+                "Deduplication happens before period filtering."
+            )
+
+            left = data_a.add_prefix(f"{sheet_a} | ")
+            right = data_b.add_prefix(f"{sheet_b} | ")
+
+            link_key = "__matching_uid"
+            while link_key in left.columns or link_key in right.columns:
+                link_key += "_"
+
+            left[link_key] = normalise_uid(data_a[uid_a])
+            right[link_key] = normalise_uid(data_b[uid_b])
+
+            missing_a = int(left[link_key].isna().sum())
+            missing_b = int(right[link_key].isna().sum())
+
+            if missing_a or missing_b:
+                st.caption(
+                    f"Missing UIDs: {missing_a:,} in first sheet; "
+                    f"{missing_b:,} in second. Missing UIDs never match."
+                )
+
+            # Prevent missing keys from matching each other.
+            right = right[right[link_key].notna()].copy()
+
+            match_count = int(left[link_key].isin(right[link_key]).sum())
+            st.info(
+                f"{match_count:,} of {len(left):,} retained first-sheet "
+                "records match the second sheet."
+            )
+
+            df = left.merge(
+                right,
+                on=link_key,
+                how=(
+                    "left"
+                    if join_choice == "All records from first sheet"
+                    else "inner"
+                ),
+                validate="many_to_one",
+            ).drop(columns=link_key)
+
+except Exception as error:
+    st.error(f"Could not prepare the file: {error}")
+    st.stop()
+
+df = df.reset_index(drop=True)
+
+if df.empty:
+    st.warning("No records available.")
+    st.stop()
+
+st.caption(f"Before filtering: {len(df):,} rows")
+
+with st.expander("Preview source or joined data"):
+    st.dataframe(df.head(100), use_container_width=True)
+
+
+# ===========================
+# DATE AND VALUE FILTERS
+# ===========================
+
+with st.sidebar:
+    st.header("Filters")
+
+    date_column = st.selectbox(
+        "Date column for period filter",
+        ["None"] + list(df.columns),
+        key="setting_filter_date",
+    )
+
+    if date_column != "None":
+        date_format = st.selectbox(
+            "Date format",
+            DATE_FORMATS,
+            key="setting_filter_date_format",
+        )
+
+        dates = parse_dates(df[date_column], date_format)
+        valid = dates.dropna()
+
+        if valid.empty:
+            st.warning("No valid dates. Check the column and format.")
+            st.stop()
+
+        earliest = valid.min().date()
+        latest = valid.max().date()
+
+        selected_range = st.date_input(
+            "Start and end dates",
+            value=(earliest, latest),
+            min_value=earliest,
+            max_value=latest,
+            key=(
+                f"setting_range_{file_id}_{date_column}_"
+                f"{date_format}_{earliest}_{latest}"
+            ),
+        )
+
+        if len(selected_range) != 2:
+            st.info("Select both start and end dates.")
+            st.stop()
+
+        start, end = selected_range
+
+        if start > end:
+            st.error("Start date must be before end date.")
+            st.stop()
+
+        invalid = int(dates.isna().sum())
+        if invalid:
+            st.caption(
+                f"{invalid:,} missing or invalid dates excluded."
+            )
+
+        mask = (
+            dates.notna()
+            & (dates.dt.date >= start)
+            & (dates.dt.date <= end)
+        )
+        df = df.loc[mask].copy()
+
+    filter_columns = st.multiselect(
+        "Columns to filter",
+        list(df.columns),
+        key="setting_filter_columns",
+        help="For example: township, gender, year, quarter or indicator.",
+    )
+
+    for column in filter_columns:
+        values = df[column].astype("string")
+        options = sorted(values.dropna().unique().tolist())
+
+        selected = st.multiselect(
+            f"Include: {column}",
+            options,
+            default=options,
+            key=f"setting_values_{column}",
+        )
+        include_missing = st.checkbox(
+            f"Include missing: {column}",
+            value=True,
+            key=f"setting_missing_{column}",
+        )
+
+        mask = values.isin(selected)
+        if include_missing:
+            mask = mask | values.isna()
+
+        df = df.loc[mask].copy()
+
+if df.empty:
+    st.warning("No records match the filters.")
+    st.stop()
+
+st.success(f"Records after filtering: {len(df):,}")
+
+with st.expander("Filtered data"):
+    st.dataframe(df.head(100), use_container_width=True)
+
+download_table(
+    df,
+    "filtered_data.csv",
+    "Download filtered data",
+    "filtered_download",
+)
+
+
+# ===========================
+# ANALYSIS SETTINGS
+# ===========================
+
+st.subheader("Choose analysis settings")
+
+columns = list(df.columns)
+first, second = st.columns(2)
+
+with first:
+    actual_column = st.selectbox(
+        "Actual/result column",
+        columns,
+        key="setting_actual",
+    )
+    aggregation = st.selectbox(
+        "Combine results using",
+        ["Sum", "Mean"],
+        key="setting_aggregation",
+    )
+    period_column = st.selectbox(
+        "Trend date or period column",
+        ["None"] + columns,
+        key="setting_period",
+    )
+
+with second:
+    group_column = st.selectbox(
+        "Group column",
+        ["None"] + columns,
+        key="setting_group",
+    )
+    target_column = st.selectbox(
+        "Target column",
+        ["None"] + [
+            column for column in columns
+            if column != actual_column
+        ],
+        key="setting_target",
+    )
+
+st.caption(
+    "Analyse one indicator and unit at a time. "
+    "Sum is suitable for additive counts or amounts. "
+    "Rates may require weighted calculations. "
+    "Actual and target values must use the same units and record level."
+)
+
+period_mode = "Keep labels"
+trend_format = DATE_FORMATS[0]
+frequency = "Monthly"
+
+if period_column != "None":
+    period_mode = st.radio(
+        "Trend period format",
+        ["Keep labels", "Dates"],
+        horizontal=True,
+        key="setting_period_mode",
+    )
+
+    if period_mode == "Dates":
+        trend_format = st.selectbox(
+            "Trend date format",
+            DATE_FORMATS,
+            key="setting_trend_format",
+        )
+        frequency = st.selectbox(
+            "Trend frequency",
+            ["Monthly", "Quarterly", "Yearly"],
+            key="setting_frequency",
+        )
+
 data = pd.DataFrame(index=df.index)
 data["Actual"] = numeric_values(df[actual_column])
 
 invalid_actual = int(data["Actual"].isna().sum())
-
 if invalid_actual:
     st.warning(
-        f"{invalid_actual:,} rows have missing or non-numeric "
-        "actual values and are excluded."
+        f"{invalid_actual:,} rows with missing or non-numeric "
+        "actual values excluded from analysis."
     )
 
 data = data[data["Actual"].notna()].copy()
 
 if data.empty:
-    st.error("No numeric actual values were found.")
+    st.warning("No numeric actual values found.")
     st.stop()
 
 if group_column != "None":
+    group_values = df.loc[data.index, group_column].astype("string")
     data["Group"] = (
-        df.loc[data.index, group_column]
-        .astype("string")
+        group_values.str.strip()
+        .replace("", pd.NA)
         .fillna("(Missing)")
-        .replace("", "(Missing)")
     )
 
 if target_column != "None":
-    data["Target"] = numeric_values(
-        df.loc[data.index, target_column]
-    )
+    data["Target"] = numeric_values(df.loc[data.index, target_column])
 
 if period_column != "None":
     source_period = df.loc[data.index, period_column]
 
     if period_mode == "Dates":
-        dates = pd.to_datetime(
-            source_period,
-            errors="coerce",
-            dayfirst=day_first,
-        )
-        codes = {
+        dates = parse_dates(source_period, trend_format)
+        code = {
             "Monthly": "M",
             "Quarterly": "Q",
             "Yearly": "Y",
-        }
-        data["Period"] = (
-            dates.dt.to_period(codes[frequency])
-            .dt.to_timestamp()
-        )
+        }[frequency]
+        data["Period"] = dates.dt.to_period(code).dt.to_timestamp()
     else:
-        data["Period"] = source_period.astype("string")
-        data.loc[
-            source_period.isna()
-            | source_period.astype("string").str.strip().eq(""),
-            "Period",
-        ] = pd.NA
-
-method = "sum" if aggregation == "Sum" else "mean"
-
-
-def summarise(table, keys, measures):
-    if method == "sum":
-        return (
-            table.groupby(keys, sort=True)[measures]
-            .sum(min_count=1)
-            .reset_index()
+        data["Period"] = (
+            source_period.astype("string")
+            .str.strip()
+            .replace("", pd.NA)
         )
-    return (
-        table.groupby(keys, sort=True)[measures]
-        .mean()
-        .reset_index()
-    )
 
-
-def download_table(table, filename, label):
-    st.download_button(
-        label,
-        data=table.to_csv(index=False).encode("utf-8"),
-        file_name=filename,
-        mime="text/csv",
-    )
-
+method = aggregation.lower()
 
 st.subheader("Overview")
-
-metric_left, metric_right = st.columns(2)
-metric_left.metric("Rows analysed", f"{len(data):,}")
-overall = data["Actual"].agg(method)
-metric_right.metric(
+first, second = st.columns(2)
+first.metric("Rows analysed", f"{len(data):,}")
+second.metric(
     f"{aggregation} of {actual_column}",
-    f"{overall:,.2f}",
+    f"{data['Actual'].agg(method):,.2f}",
 )
 
 trend_tab, group_tab, gap_tab = st.tabs(
     ["Trends", "Group comparisons", "Target gaps"]
 )
 
+
+# ===========================
+# TREND ANALYSIS
+# ===========================
+
 with trend_tab:
     if period_column == "None":
-        st.info("Select a date or period column to view trends.")
+        st.info("Select a trend period column.")
     else:
         trend_data = data.dropna(subset=["Period"])
-        excluded = len(data) - len(trend_data)
+        invalid_periods = len(data) - len(trend_data)
 
-        if excluded:
+        if invalid_periods:
             st.caption(
-                f"{excluded:,} rows excluded from trends "
-                "because their period is missing or invalid."
+                f"{invalid_periods:,} missing or invalid periods "
+                "excluded from trends."
             )
 
         if trend_data.empty:
-            st.warning("No valid periods were found.")
+            st.warning("No valid trend periods.")
         else:
-            keys = ["Period"]
+            dimensions = ["Period"]
             if group_column != "None":
-                keys.append("Group")
+                dimensions.append("Group")
 
-            trend = summarise(trend_data, keys, ["Actual"])
+            trend = aggregate_table(
+                trend_data, dimensions, ["Actual"], method
+            )
 
-            if period_mode == "Keep labels":
-                # Preserve source order for labels such as month names.
-                order = trend_data["Period"].drop_duplicates().tolist()
-                ranks = {value: index for index, value in enumerate(order)}
-                trend["_order"] = trend["Period"].map(ranks)
-                trend = trend.sort_values(keys[1:] + ["_order"])
-                trend = trend.drop(columns="_order")
+            if period_mode == "Dates":
+                period_order = sorted(trend["Period"].unique())
+                trend = trend.sort_values(dimensions)
+            else:
+                period_order = (
+                    trend_data["Period"].drop_duplicates().tolist()
+                )
+                order = {
+                    value: index
+                    for index, value in enumerate(period_order)
+                }
+                trend["_order"] = trend["Period"].map(order)
+                trend = trend.sort_values(
+                    (["Group"] if group_column != "None" else [])
+                    + ["_order"]
+                ).drop(columns="_order")
                 st.caption(
                     "Period labels follow their first appearance "
-                    "in the uploaded data."
+                    "in the filtered data."
                 )
 
             chart = px.line(
@@ -737,59 +710,64 @@ with trend_tab:
                 y="Actual",
                 color="Group" if group_column != "None" else None,
                 markers=True,
+                category_orders={"Period": period_order},
                 title=f"{actual_column}: trend",
             )
             st.plotly_chart(chart, use_container_width=True)
             st.dataframe(trend, use_container_width=True)
 
-            # Describe changes separately for each group.
-            series_groups = (
-                trend.groupby("Group")
+            st.markdown("**Calculated findings**")
+
+            groups = (
+                trend.groupby("Group", sort=False)
                 if group_column != "None"
                 else [("Overall", trend)]
             )
 
-            st.markdown("**Calculated findings**")
-            for label, series in series_groups:
-                series = series.sort_values("Period") if (
-                    period_mode == "Dates"
-                ) else series
-
+            for label, series in groups:
                 if len(series) < 2:
                     continue
 
-                first = float(series.iloc[0]["Actual"])
-                last = float(series.iloc[-1]["Actual"])
-                change = last - first
+                initial = float(series.iloc[0]["Actual"])
+                final = float(series.iloc[-1]["Actual"])
+                difference = final - initial
 
-                statement = (
-                    f"{label}: from the first to the last displayed "
-                    f"period, results changed from {first:,.2f} "
-                    f"to {last:,.2f}, a change of {change:+,.2f}."
+                finding = (
+                    f"{label}: first to last displayed period, "
+                    f"{initial:,.2f} to {final:,.2f}. "
+                    f"Change: {difference:+,.2f}."
                 )
-                if first > 0:
-                    statement += (
+                if initial > 0:
+                    finding += (
                         f" Relative change: "
-                        f"{change / first * 100:+,.1f} percent."
+                        f"{difference / initial * 100:+,.1f} percent."
                     )
-                st.write(statement)
+                st.write(finding)
 
             download_table(
                 trend,
                 "trend_analysis.csv",
                 "Download trend table",
+                "trend_download",
             )
+
+
+# ===========================
+# GROUP COMPARISONS
+# ===========================
 
 with group_tab:
     if group_column == "None":
-        st.info("Select a group column to compare groups.")
+        st.info("Select a group column.")
     else:
-        comparison = summarise(data, ["Group"], ["Actual"])
-        comparison = sort_chart_table(
+        comparison = aggregate_table(
+            data, ["Group"], ["Actual"], method
+        )
+        comparison = sort_table(
             comparison,
-            name_column="Group",
-            value_columns=["Actual"],
-            key="group_sort",
+            "Group",
+            ["Actual"],
+            "setting_group_sort",
         )
 
         chart = px.bar(
@@ -804,84 +782,79 @@ with group_tab:
         st.plotly_chart(chart, use_container_width=True)
         st.dataframe(comparison, use_container_width=True)
 
-        highest = comparison.loc[
-            comparison["Actual"].idxmax()
-        ]
-        lowest = comparison.loc[
-            comparison["Actual"].idxmin()
-        ]
+        highest = comparison.loc[comparison["Actual"].idxmax()]
+        lowest = comparison.loc[comparison["Actual"].idxmin()]
 
         st.write(
-            f"Highest result: {highest['Group']} "
+            f"Highest: {highest['Group']} "
             f"({highest['Actual']:,.2f}). "
-            f"Lowest result: {lowest['Group']} "
+            f"Lowest: {lowest['Group']} "
             f"({lowest['Actual']:,.2f}). "
             f"Difference: "
             f"{highest['Actual'] - lowest['Actual']:,.2f}."
         )
 
         st.caption(
-            "Differences describe recorded results. They do not "
-            "explain causes or adjust for population size."
+            "These comparisons describe recorded results; "
+            "they do not adjust for group population size."
         )
 
         download_table(
             comparison,
             "group_comparison.csv",
-            "Download group comparison",
+            "Download comparison",
+            "group_download",
         )
+
+
+# ===========================
+# TARGET GAP ANALYSIS
+# ===========================
 
 with gap_tab:
     if target_column == "None":
-        st.info("Select a target column to calculate target gaps.")
+        st.info("Select a target column.")
     else:
         st.caption(
-            "Positive gap = below target. "
-            "Negative gap = above target. "
-            "This assumes higher results are desirable."
+            "Positive gap means below target; negative gap means "
+            "above target. This assumes higher results are desirable."
         )
 
         paired = data.dropna(subset=["Target"]).copy()
 
-        if len(paired) < len(data):
-            st.warning(
-                f"{len(data) - len(paired):,} rows excluded from "
-                "gap analysis because targets are missing "
-                "or non-numeric."
+        missing_targets = len(data) - len(paired)
+        if missing_targets:
+            st.caption(
+                f"{missing_targets:,} rows without numeric targets "
+                "excluded from gap analysis."
             )
 
         if paired.empty:
-            st.warning("No rows have both actual and target values.")
+            st.warning("No records have both actual and target values.")
         else:
-            possible_dimensions = []
+            available = []
             if group_column != "None":
-                possible_dimensions.append("Group")
+                available.append("Group")
             if period_column != "None":
-                possible_dimensions.append("Period")
+                available.append("Period")
 
             dimensions = st.multiselect(
                 "Calculate gaps by",
-                possible_dimensions,
-                default=possible_dimensions,
+                available,
+                default=available,
+                key="setting_gap_dimensions",
             )
 
             if dimensions:
                 paired = paired.dropna(subset=dimensions)
-                gaps = summarise(
-                    paired,
-                    dimensions,
-                    ["Actual", "Target"],
-                )
-            else:
-                gaps = pd.DataFrame({
-                    "Scope": ["Overall"],
-                    "Actual": [paired["Actual"].agg(method)],
-                    "Target": [paired["Target"].agg(method)],
-                })
 
-            if gaps.empty:
-                st.warning("No valid rows for these gap dimensions.")
+            if paired.empty:
+                st.warning("No valid records for these dimensions.")
             else:
+                gaps = aggregate_table(
+                    paired, dimensions, ["Actual", "Target"], method
+                )
+
                 gaps["Gap"] = gaps["Target"] - gaps["Actual"]
                 gaps["Achievement (percent)"] = (
                     gaps["Actual"]
@@ -889,25 +862,27 @@ with gap_tab:
                     * 100
                 )
 
-                label_columns = dimensions or ["Scope"]
-                gaps["Comparison"] = (
-                    gaps[label_columns].astype(str)
-                    .agg(" | ".join, axis=1)
-                )
+                if dimensions:
+                    gaps["Comparison"] = (
+                        gaps[dimensions].astype(str)
+                        .agg(" | ".join, axis=1)
+                    )
+                else:
+                    gaps["Comparison"] = "Overall"
 
-                gaps = sort_chart_table(
+                gaps = sort_table(
                     gaps,
-                    name_column="Comparison",
-                    value_columns=[
+                    "Comparison",
+                    [
                         "Actual",
                         "Target",
                         "Gap",
                         "Achievement (percent)",
                     ],
-                    key="gap_sort",
+                    "setting_gap_sort",
                 )
-                
-                plot_data = gaps.melt(
+
+                chart_data = gaps.melt(
                     id_vars=["Comparison"],
                     value_vars=["Actual", "Target"],
                     var_name="Measure",
@@ -915,7 +890,7 @@ with gap_tab:
                 )
 
                 chart = px.bar(
-                    plot_data,
+                    chart_data,
                     x="Comparison",
                     y="Value",
                     color="Measure",
@@ -926,16 +901,12 @@ with gap_tab:
                     title="Actual versus target",
                 )
                 st.plotly_chart(chart, use_container_width=True)
-
-
                 st.dataframe(gaps, use_container_width=True)
 
                 shortfalls = gaps[gaps["Gap"] > 0]
 
                 if shortfalls.empty:
-                    st.success(
-                        "No shortfalls in the displayed comparisons."
-                    )
+                    st.success("No shortfalls in these comparisons.")
                 else:
                     largest = shortfalls.loc[
                         shortfalls["Gap"].idxmax()
@@ -943,36 +914,12 @@ with gap_tab:
                     st.write(
                         f"Largest shortfall: "
                         f"{largest['Comparison']}, "
-                        f"with a gap of {largest['Gap']:,.2f}."
+                        f"gap {largest['Gap']:,.2f}."
                     )
 
                 download_table(
                     gaps,
                     "target_gap_analysis.csv",
-                    "Download gap analysis",
+                    "Download gap table",
+                    "gap_download",
                 )
-                
-def sort_chart_table(table, name_column, value_columns, key):
-    """Let the user choose a sorting column and direction."""
-    left, right = st.columns(2)
-
-    with left:
-        sort_column = st.selectbox(
-            "Sort by",
-            [name_column] + value_columns,
-            key=f"{key}_column",
-        )
-
-    with right:
-        sort_direction = st.selectbox(
-            "Sort direction",
-            ["Ascending", "Descending"],
-            key=f"{key}_direction",
-        )
-
-    return table.sort_values(
-        by=sort_column,
-        ascending=sort_direction == "Ascending",
-        kind="stable",
-        na_position="last",
-    ).reset_index(drop=True)
