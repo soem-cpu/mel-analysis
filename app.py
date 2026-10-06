@@ -10,9 +10,38 @@ st.set_page_config(
 
 st.title("M&E Data Analysis")
 st.write(
-    "Upload your dataset to compare trends, analyse groups "
-    "and calculate gaps against targets."
+    "Upload Excel or CSV data. Analyse one sheet or connect "
+    "two sheets using a shared identifier."
 )
+
+
+def prepare_sheet(frame):
+    """Clean column names and remove completely empty rows."""
+    frame = frame.copy()
+    frame.columns = [
+        str(column).strip()
+        for column in frame.columns
+    ]
+    frame = frame.dropna(how="all").reset_index(drop=True)
+
+    if frame.columns.duplicated().any():
+        st.error(
+            "Duplicate column names found. "
+            "Rename the duplicate columns in your file."
+        )
+        st.stop()
+
+    return frame
+
+
+def normalise_uid(series):
+    """
+    Convert identifiers to trimmed text.
+    Blank identifiers remain missing, so they cannot match.
+    """
+    values = series.astype("string").str.strip()
+    return values.mask(values.eq(""))
+
 
 uploaded_file = st.file_uploader(
     "Upload an Excel or CSV file",
@@ -25,60 +54,385 @@ if uploaded_file is None:
 
 try:
     if uploaded_file.name.lower().endswith(".csv"):
-        df = pd.read_csv(uploaded_file)
+        df = prepare_sheet(
+            pd.read_csv(uploaded_file, dtype=object)
+        )
+
     else:
         workbook = pd.ExcelFile(uploaded_file)
-        sheet = st.selectbox("Select a sheet", workbook.sheet_names)
-        header_row = st.number_input(
-            "Row containing column names",
-            min_value=1,
-            value=1,
-            step=1,
+
+        mode = st.radio(
+            "How would you like to use this workbook?",
+            (
+                ["Analyse one sheet", "Connect two sheets"]
+                if len(workbook.sheet_names) >= 2
+                else ["Analyse one sheet"]
+            ),
+            horizontal=True,
         )
-        df = pd.read_excel(workbook, sheet_name=sheet, header=header_row - 1)
+
+        if mode == "Analyse one sheet":
+            sheet_name = st.selectbox(
+                "Select sheet",
+                workbook.sheet_names,
+            )
+
+            header_row = st.number_input(
+                "Row containing column names",
+                min_value=1,
+                value=1,
+                step=1,
+                key="single_header",
+            )
+
+            df = prepare_sheet(
+                pd.read_excel(
+                    workbook,
+                    sheet_name=sheet_name,
+                    header=header_row - 1,
+                    dtype=object,
+                )
+            )
+
+        else:
+            first, second = st.columns(2)
+
+            with first:
+                sheet_a = st.selectbox(
+                    "First sheet: main records",
+                    workbook.sheet_names,
+                    key="sheet_a",
+                )
+                header_a = st.number_input(
+                    "Header row in first sheet",
+                    min_value=1,
+                    value=1,
+                    step=1,
+                    key="header_a",
+                )
+
+            with second:
+                sheet_b = st.selectbox(
+                    "Second sheet: linked records",
+                    [
+                        name for name in workbook.sheet_names
+                        if name != sheet_a
+                    ],
+                    key="sheet_b",
+                )
+                header_b = st.number_input(
+                    "Header row in second sheet",
+                    min_value=1,
+                    value=1,
+                    step=1,
+                    key="header_b",
+                )
+
+            data_a = prepare_sheet(
+                pd.read_excel(
+                    workbook,
+                    sheet_name=sheet_a,
+                    header=header_a - 1,
+                    dtype=object,
+                )
+            )
+            data_b = prepare_sheet(
+                pd.read_excel(
+                    workbook,
+                    sheet_name=sheet_b,
+                    header=header_b - 1,
+                    dtype=object,
+                )
+            )
+
+            if data_a.empty or data_b.empty:
+                st.warning(
+                    "Both selected sheets must contain data."
+                )
+                st.stop()
+
+            first, second = st.columns(2)
+
+            with first:
+                uid_a = st.selectbox(
+                    "UID column in first sheet",
+                    list(data_a.columns),
+                    key="uid_a",
+                )
+
+            with second:
+                uid_b = st.selectbox(
+                    "UID column in second sheet",
+                    list(data_b.columns),
+                    key="uid_b",
+                )
+
+            st.caption(
+                "Use a stable patient ID where possible. "
+                "Names can be shared by different people. "
+                "UID matching is exact after trimming spaces."
+            )
+
+            join_choice = st.selectbox(
+                "Which records should be included?",
+                [
+                    "All records from first sheet",
+                    "Only records matched in both sheets",
+                ],
+            )
+
+            # Prefix columns so their source remains clear.
+            left = data_a.add_prefix(f"{sheet_a} | ")
+            right = data_b.add_prefix(f"{sheet_b} | ")
+
+            # Find an internal key name that cannot overwrite
+            # any source column.
+            join_key = "__link_uid"
+            while join_key in left.columns or join_key in right.columns:
+                join_key += "_"
+
+            left[join_key] = normalise_uid(data_a[uid_a])
+            right[join_key] = normalise_uid(data_b[uid_b])
+
+            left_keys = left[join_key].dropna()
+            right_keys = right[join_key].dropna()
+
+            duplicate_a = left_keys.duplicated().any()
+            duplicate_b = right_keys.duplicated().any()
+
+            if duplicate_a and duplicate_b:
+                st.error(
+                    "The UID repeats in both sheets. Joining "
+                    "these sheets could multiply records and "
+                    "inflate results. Use a unique record ID "
+                    "or summarise one sheet to one row per UID."
+                )
+                st.stop()
+
+            if duplicate_b:
+                st.error(
+                    "The second sheet has multiple rows per UID. "
+                    "To preserve the first sheet's record count, "
+                    "swap the sheets so the sheet with repeated "
+                    "UIDs is first."
+                )
+                st.stop()
+
+            missing_a = int(left[join_key].isna().sum())
+            missing_b = int(right[join_key].isna().sum())
+
+            if missing_a or missing_b:
+                st.warning(
+                    f"Missing UIDs: {missing_a:,} in the first "
+                    f"sheet and {missing_b:,} in the second. "
+                    "Missing UIDs are never matched."
+                )
+
+            # Remove missing right-side keys to prevent pandas
+            # from matching missing identifiers with each other.
+            right = right[right[join_key].notna()].copy()
+
+            matched = left[join_key].isin(right[join_key])
+            matched_count = int(matched.sum())
+
+            st.info(
+                f"{matched_count:,} of {len(left):,} first-sheet "
+                "records have a matching UID in the second sheet."
+            )
+
+            how = (
+                "left"
+                if join_choice == "All records from first sheet"
+                else "inner"
+            )
+
+            df = left.merge(
+                right,
+                on=join_key,
+                how=how,
+                validate="many_to_one",
+            ).drop(columns=join_key)
+
+            st.caption(
+                "Each result row represents a first-sheet "
+                "record, with matching second-sheet information "
+                "attached. A second-sheet value may repeat "
+                "across several first-sheet records."
+            )
 
 except Exception as error:
-    st.error(f"Could not read the file: {error}")
+    st.error(f"Could not prepare the uploaded file: {error}")
     st.stop()
-
-df.columns = [str(column).strip() for column in df.columns]
-df = df.dropna(how="all")
 
 if df.empty:
-    st.warning("The selected dataset contains no data rows.")
+    st.warning("No data rows are available.")
     st.stop()
 
-if df.columns.duplicated().any():
-    st.error("Column names must be unique. Rename duplicate columns.")
-    st.stop()
+st.caption(
+    f"Before filtering: {len(df):,} rows | "
+    f"{len(df.columns):,} columns"
+)
 
-st.caption(f"{len(df):,} rows | {len(df.columns):,} columns")
-
-with st.expander("Preview data"):
+with st.expander("Preview data before filtering"):
     st.dataframe(df.head(100), use_container_width=True)
 
-# Optional filter, for example to select one indicator.
+
+# ===========================
+# FILTERS
+# ===========================
+
 with st.sidebar:
     st.header("Filter data")
-    filter_column = st.selectbox(
-        "Filter by a column",
+
+    st.subheader("Date range")
+
+    date_column = st.selectbox(
+        "Date column",
         ["None"] + list(df.columns),
+        key="date_filter_column",
+        help=(
+            "Select a full date column for a date range. "
+            "For labels such as January or Quarter II, "
+            "use the value filters below."
+        ),
     )
 
-    if filter_column != "None":
-        options = sorted(
-            df[filter_column].dropna().astype(str).unique().tolist()
+    if date_column != "None":
+        date_format = st.selectbox(
+            "Date format",
+            [
+                "Automatic: day first",
+                "Automatic: month first",
+                "YYYY-MM-DD",
+                "DD/MM/YYYY",
+                "MM/DD/YYYY",
+            ],
+            key="date_filter_format",
         )
-        selected = st.multiselect(
-            "Include values",
+
+        explicit_formats = {
+            "YYYY-MM-DD": "%Y-%m-%d",
+            "DD/MM/YYYY": "%d/%m/%Y",
+            "MM/DD/YYYY": "%m/%d/%Y",
+        }
+
+        if date_format in explicit_formats:
+            parsed_dates = pd.to_datetime(
+                df[date_column],
+                format=explicit_formats[date_format],
+                errors="coerce",
+            )
+        else:
+            parsed_dates = pd.to_datetime(
+                df[date_column],
+                errors="coerce",
+                dayfirst=date_format == "Automatic: day first",
+            )
+
+        valid_dates = parsed_dates.dropna()
+
+        if valid_dates.empty:
+            st.warning(
+                "No valid dates found. Check the selected "
+                "column and date format."
+            )
+            st.stop()
+
+        earliest = valid_dates.min().date()
+        latest = valid_dates.max().date()
+
+        # A changed file/column/range gets a fresh date selector.
+        date_widget_key = (
+            f"range_{uploaded_file.name}_{date_column}_"
+            f"{date_format}_{earliest}_{latest}"
+        )
+
+        selected_range = st.date_input(
+            "Include dates from / to",
+            value=(earliest, latest),
+            min_value=earliest,
+            max_value=latest,
+            key=date_widget_key,
+        )
+
+        if len(selected_range) != 2:
+            st.info("Select both the start and end dates.")
+            st.stop()
+
+        start_date, end_date = selected_range
+
+        if start_date > end_date:
+            st.error("Start date must be before end date.")
+            st.stop()
+
+        missing_dates = int(parsed_dates.isna().sum())
+
+        if missing_dates:
+            st.caption(
+                f"{missing_dates:,} rows with missing or "
+                "invalid dates are excluded."
+            )
+
+        # Compare calendar dates so times on the end date
+        # remain included.
+        mask = (
+            parsed_dates.notna()
+            & (parsed_dates.dt.date >= start_date)
+            & (parsed_dates.dt.date <= end_date)
+        )
+        df = df.loc[mask].copy()
+
+    st.subheader("Value filters")
+
+    filter_columns = st.multiselect(
+        "Select columns to filter",
+        list(df.columns),
+        key="value_filter_columns",
+        help=(
+            "For example: township, gender, indicator, "
+            "year, reporting month or quarter."
+        ),
+    )
+
+    for position, column in enumerate(filter_columns):
+        values = df[column].astype("string")
+        options = sorted(values.dropna().unique().tolist())
+
+        chosen_values = st.multiselect(
+            f"Include values in {column}",
             options,
             default=options,
+            key=f"value_filter_{position}_{column}",
         )
-        df = df[df[filter_column].astype(str).isin(selected)].copy()
+
+        include_missing = st.checkbox(
+            f"Include missing values in {column}",
+            value=True,
+            key=f"missing_filter_{position}_{column}",
+        )
+
+        mask = values.isin(chosen_values)
+
+        if include_missing:
+            mask = mask | values.isna()
+
+        df = df.loc[mask].copy()
 
 if df.empty:
-    st.warning("No rows match the selected filter.")
+    st.warning("No records match the selected filters.")
     st.stop()
+
+st.success(f"Records after filtering: {len(df):,}")
+
+with st.expander("Preview filtered data"):
+    st.dataframe(df.head(100), use_container_width=True)
+
+st.download_button(
+    "Download filtered data",
+    data=df.to_csv(index=False).encode("utf-8"),
+    file_name="filtered_data.csv",
+    mime="text/csv",
+)
 
 st.subheader("Choose analysis settings")
 
