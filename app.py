@@ -194,30 +194,120 @@ try:
             left[join_key] = normalise_uid(data_a[uid_a])
             right[join_key] = normalise_uid(data_b[uid_b])
 
-            left_keys = left[join_key].dropna()
-            right_keys = right[join_key].dropna()
+            # Show duplicate UIDs before removing them.
+            duplicate_tables = []
 
-            duplicate_a = left_keys.duplicated().any()
-            duplicate_b = right_keys.duplicated().any()
-
-            if duplicate_a and duplicate_b:
-                st.error(
-                    "The UID repeats in both sheets. Joining "
-                    "these sheets could multiply records and "
-                    "inflate results. Use a unique record ID "
-                    "or summarise one sheet to one row per UID."
+            for source_name, source_data, uid_column in [
+                (sheet_a, data_a, uid_a),
+                (sheet_b, data_b, uid_b),
+            ]:
+                normalised_keys = normalise_uid(
+                    source_data[uid_column]
                 )
-                st.stop()
 
-            if duplicate_b:
-                st.error(
-                    "The second sheet has multiple rows per UID. "
-                    "To preserve the first sheet's record count, "
-                    "swap the sheets so the sheet with repeated "
-                    "UIDs is first."
+                duplicate_mask = (
+                    normalised_keys.notna()
+                    & normalised_keys.duplicated(keep=False)
                 )
-                st.stop()
 
+                if duplicate_mask.any():
+                    duplicate_rows = source_data.loc[
+                        duplicate_mask
+                    ].copy()
+
+                    # Add review information without overwriting
+                    # any original source column.
+                    review_info = pd.DataFrame(
+                        {
+                            "Source sheet": source_name,
+                            "UID used for matching": (
+                                normalised_keys.loc[
+                                    duplicate_mask
+                                ]
+                            ),
+                            "Action": [
+                                (
+                                    "Keep first occurrence"
+                                    if not is_repeat
+                                    else "Exclude from analysis"
+                                )
+                                for is_repeat in (
+                                    normalised_keys
+                                    .duplicated(keep="first")
+                                    .loc[duplicate_mask]
+                                )
+                            ],
+                        },
+                        index=duplicate_rows.index,
+                    )
+
+                    duplicate_rows = duplicate_rows.add_prefix(
+                        "Source | "
+                    )
+
+                    duplicate_tables.append(
+                        pd.concat(
+                            [review_info, duplicate_rows],
+                            axis=1,
+                        )
+                    )
+
+            if duplicate_tables:
+                duplicate_report = pd.concat(
+                    duplicate_tables,
+                    ignore_index=True,
+                    sort=False,
+                )
+
+                st.warning(
+                    "Repeated UIDs found. The first occurrence "
+                    "of each UID in each sheet will be kept. "
+                    "Later occurrences will be excluded from "
+                    "all subsequent analysis."
+                )
+
+                with st.expander(
+                    "Review duplicated UIDs and source records",
+                    expanded=True,
+                ):
+                    st.dataframe(
+                        duplicate_report,
+                        use_container_width=True,
+                    )
+
+                    st.download_button(
+                        "Download duplicate UID report",
+                        data=duplicate_report.to_csv(
+                            index=False
+                        ).encode("utf-8"),
+                        file_name="duplicate_uid_report.csv",
+                        mime="text/csv",
+                    )
+
+            # Keep the first row for each non-missing UID.
+            # Rows with missing UIDs remain separate and
+            # will never match each other.
+            repeat_left = (
+                left[join_key].notna()
+                & left[join_key].duplicated(keep="first")
+            )
+
+            repeat_right = (
+                right[join_key].notna()
+                & right[join_key].duplicated(keep="first")
+            )
+
+            removed_left = int(repeat_left.sum())
+            removed_right = int(repeat_right.sum())
+
+            left = left.loc[~repeat_left].copy()
+            right = right.loc[~repeat_right].copy()
+
+            st.caption(
+                f"Duplicate rows excluded: "
+                f"{removed_left:,} from {sheet_a}; "
+                f"{removed_right:,} from {sheet_b}."
+            )
             missing_a = int(left[join_key].isna().sum())
             missing_b = int(right[join_key].isna().sum())
 
