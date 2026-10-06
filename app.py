@@ -785,19 +785,31 @@ with group_tab:
         st.info("Select a group column to compare groups.")
     else:
         comparison = summarise(data, ["Group"], ["Actual"])
-        comparison = comparison.sort_values("Actual", ascending=False)
+        comparison = sort_chart_table(
+            comparison,
+            name_column="Group",
+            value_columns=["Actual"],
+            key="group_sort",
+        )
 
         chart = px.bar(
             comparison,
             x="Group",
             y="Actual",
+            category_orders={
+                "Group": comparison["Group"].tolist()
+            },
             title=f"{actual_column} by {group_column}",
         )
         st.plotly_chart(chart, use_container_width=True)
         st.dataframe(comparison, use_container_width=True)
 
-        highest = comparison.iloc[0]
-        lowest = comparison.iloc[-1]
+        highest = comparison.loc[
+            comparison["Actual"].idxmax()
+        ]
+        lowest = comparison.loc[
+            comparison["Actual"].idxmin()
+        ]
 
         st.write(
             f"Highest result: {highest['Group']} "
@@ -883,6 +895,18 @@ with gap_tab:
                     .agg(" | ".join, axis=1)
                 )
 
+                gaps = sort_chart_table(
+                    gaps,
+                    name_column="Comparison",
+                    value_columns=[
+                        "Actual",
+                        "Target",
+                        "Gap",
+                        "Achievement (percent)",
+                    ],
+                    key="gap_sort",
+                )
+                
                 plot_data = gaps.melt(
                     id_vars=["Comparison"],
                     value_vars=["Actual", "Target"],
@@ -896,11 +920,14 @@ with gap_tab:
                     y="Value",
                     color="Measure",
                     barmode="group",
+                    category_orders={
+                        "Comparison": gaps["Comparison"].tolist()
+                    },
                     title="Actual versus target",
                 )
                 st.plotly_chart(chart, use_container_width=True)
 
-                gaps = gaps.sort_values("Gap", ascending=False)
+
                 st.dataframe(gaps, use_container_width=True)
 
                 shortfalls = gaps[gaps["Gap"] > 0]
@@ -910,7 +937,9 @@ with gap_tab:
                         "No shortfalls in the displayed comparisons."
                     )
                 else:
-                    largest = shortfalls.iloc[0]
+                    largest = shortfalls.loc[
+                        shortfalls["Gap"].idxmax()
+                    ]
                     st.write(
                         f"Largest shortfall: "
                         f"{largest['Comparison']}, "
