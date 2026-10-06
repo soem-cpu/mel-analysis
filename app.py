@@ -922,3 +922,28 @@ with gap_tab:
                     "target_gap_analysis.csv",
                     "Download gap analysis",
                 )
+                
+def sort_chart_table(table, name_column, value_columns, key):
+    """Let the user choose a sorting column and direction."""
+    left, right = st.columns(2)
+
+    with left:
+        sort_column = st.selectbox(
+            "Sort by",
+            [name_column] + value_columns,
+            key=f"{key}_column",
+        )
+
+    with right:
+        sort_direction = st.selectbox(
+            "Sort direction",
+            ["Ascending", "Descending"],
+            key=f"{key}_direction",
+        )
+
+    return table.sort_values(
+        by=sort_column,
+        ascending=sort_direction == "Ascending",
+        kind="stable",
+        na_position="last",
+    ).reset_index(drop=True)
