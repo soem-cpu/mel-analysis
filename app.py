@@ -654,11 +654,11 @@ with table_tab:
 
     # ---------------------------
     # Second comparison table
-    # Township performance by quarter
+    # Performance by Category and Period
     # ---------------------------
 
     st.divider()
-    st.subheader("Township performance by quarter")
+    st.subheader("Performance by category and period")
 
     st.caption(
         "Select the achieved/result metric and the target metric. "
@@ -776,8 +776,8 @@ with table_tab:
 
         download(
             quarter_table,
-            "township_performance_by_quarter.csv",
-            "quarter_performance_download",
+            "performance_by_category_and_period.csv",
+            "performance_by_category_and_period_download",
         )
 
         with st.expander("View achieved values and targets"):
@@ -810,7 +810,7 @@ with table_tab:
                     "Group": "Township / category",
                     "Period": "Quarter / period",
                 },
-                title="Township performance by quarter",
+                title="Performance by category and period",
             )
 
             figure.add_hline(
