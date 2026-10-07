@@ -95,7 +95,7 @@ def category_order(table, category, metric, direction):
 # Header and upload
 # ---------------------------
 
-st.title("📊 M&E Dashboard")
+st.title("📊 M&E Data Analysis")
 st.caption("Upload your data • Choose metrics • Explore results")
 
 with st.sidebar:
