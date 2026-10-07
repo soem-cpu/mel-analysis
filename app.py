@@ -652,6 +652,184 @@ with table_tab:
     st.caption("Click a column heading to sort the displayed table.")
     download(table, "comparison_table.csv", "table_download")
 
+    # ---------------------------
+    # Second comparison table
+    # Township performance by quarter
+    # ---------------------------
+
+    st.divider()
+    st.subheader("Township performance by quarter")
+
+    st.caption(
+        "Select the achieved/result metric and the target metric. "
+        "Performance = total achieved ÷ total target × 100."
+    )
+
+    first, second = st.columns(2)
+
+    with first:
+        achieved_metric = st.selectbox(
+            "Achieved / result metric",
+            metric_names,
+            key=f"{file_key}_quarter_achieved",
+        )
+
+    with second:
+        target_metric = st.selectbox(
+            "Target metric",
+            metric_names,
+            key=f"{file_key}_quarter_target",
+        )
+
+    if achieved_metric == target_metric:
+        st.info(
+            "Select different achieved and target metrics "
+            "to calculate performance."
+        )
+
+    else:
+        selected = data[
+            data["Metric"].isin([
+                achieved_metric,
+                target_metric,
+            ])
+        ]
+
+        # Aggregate by both dimensions.
+        # No individual records are linked.
+        performance_totals = summarise(
+            selected,
+            ["Group", "Period", "Metric"],
+            "Total",
+        )
+
+        performance_wide = performance_totals.pivot(
+            index=["Group", "Period"],
+            columns="Metric",
+            values="Value",
+        )
+
+        performance = pd.DataFrame(
+            {
+                "Achieved": performance_wide[achieved_metric],
+                "Target": performance_wide[target_metric],
+            },
+            index=performance_wide.index,
+        ).reset_index()
+
+        performance["Performance (percent)"] = (
+            performance["Achieved"]
+            / performance["Target"].where(
+                performance["Target"] > 0
+            )
+            * 100
+        )
+
+        # Rows = townships; columns = quarters.
+        quarter_table = performance.pivot(
+            index="Group",
+            columns="Period",
+            values="Performance (percent)",
+        )
+
+        quarter_order = sorted(
+            quarter_table.columns.tolist(),
+            key=lambda value: str(value).casefold(),
+        )
+
+        quarter_table = quarter_table.reindex(
+            columns=quarter_order
+        ).reset_index()
+
+        quarter_table.columns.name = None
+        quarter_table = quarter_table.rename(
+            columns={"Group": "Township / category"}
+        )
+
+        first, second = st.columns(2)
+
+        with first:
+            sort_column = st.selectbox(
+                "Sort performance table by",
+                quarter_table.columns.tolist(),
+                key="quarter_performance_sort",
+            )
+
+        with second:
+            sort_direction = st.selectbox(
+                "Order",
+                ["Ascending", "Descending"],
+                key="quarter_performance_direction",
+            )
+
+        quarter_table = quarter_table.sort_values(
+            sort_column,
+            ascending=sort_direction == "Ascending",
+            kind="stable",
+            na_position="last",
+        ).reset_index(drop=True)
+
+        st.dataframe(
+            quarter_table.round(1),
+            use_container_width=True,
+        )
+
+        download(
+            quarter_table,
+            "township_performance_by_quarter.csv",
+            "quarter_performance_download",
+        )
+
+        with st.expander("View achieved values and targets"):
+            st.dataframe(
+                performance.round(2),
+                use_container_width=True,
+            )
+
+        # Figure for the same comparison.
+        valid_performance = performance.dropna(
+            subset=["Performance (percent)"]
+        )
+
+        if not valid_performance.empty:
+            figure = px.bar(
+                valid_performance,
+                x="Group",
+                y="Performance (percent)",
+                color="Period",
+                barmode="group",
+                text_auto=".1f",
+                template="plotly_white",
+                category_orders={
+                    "Group": quarter_table[
+                        "Township / category"
+                    ].tolist(),
+                    "Period": quarter_order,
+                },
+                labels={
+                    "Group": "Township / category",
+                    "Period": "Quarter / period",
+                },
+                title="Township performance by quarter",
+            )
+
+            figure.add_hline(
+                y=100,
+                line_dash="dot",
+                annotation_text="Target achieved",
+            )
+
+            st.plotly_chart(
+                figure,
+                use_container_width=True,
+            )
+
+        st.caption(
+            "Blank cells indicate missing achieved values, "
+            "missing targets or non-positive targets. "
+            "Targets must belong to the same township and quarter "
+            "as the achieved values."
+        )
 
 # ---------------------------
 # Percentages
