@@ -98,81 +98,151 @@ def category_order(table, category, metric, direction):
 st.title("📊 M&E Data Analysis")
 st.caption("Upload your data • Choose metrics • Explore results")
 
+# ---------------------------
+# Upload multiple files
+# ---------------------------
+
 with st.sidebar:
     st.header("1 · Upload data")
-    uploaded = st.file_uploader(
-        "Excel or CSV file",
+
+    uploaded_files = st.file_uploader(
+        "Upload Excel or CSV files",
         type=["xlsx", "csv"],
+        accept_multiple_files=True,
+        help="Select one or several files.",
     )
 
-if uploaded is None:
-    st.info("👈 Upload an Excel or CSV file in the sidebar.")
+if not uploaded_files:
+    st.info("👈 Upload one or more Excel/CSV files in the sidebar.")
 
     a, b, c = st.columns(3)
-    a.markdown("### 📁 Upload\nUse one or several Excel sheets.")
+    a.markdown("### 📁 Upload\nAdd files and select their sheets.")
     b.markdown("### 🎯 Select\nChoose metrics, township and period.")
     c.markdown("### 📈 Explore\nView charts, tables and percentages.")
     st.stop()
 
-content = uploaded.getvalue()
-file_key = hashlib.sha256(content).hexdigest()[:10]
+# Identify the complete selection for widget keys.
+selection_hash = hashlib.sha256()
 
-try:
-    with st.sidebar:
-        if uploaded.name.lower().endswith(".csv"):
-            sheet_names = ["CSV"]
-            selected_sheets = sheet_names
-        else:
-            workbook = pd.ExcelFile(BytesIO(content))
-            sheet_names = workbook.sheet_names
-            selected_sheets = st.multiselect(
-                "Use these sheets",
-                sheet_names,
-                default=sheet_names[:2],
-                key=f"{file_key}_sheets",
-            )
+for uploaded_file in uploaded_files:
+    selection_hash.update(uploaded_file.name.encode("utf-8"))
+    selection_hash.update(uploaded_file.getvalue())
 
-        with st.expander("File settings"):
-            header_row = st.number_input(
-                "Header row",
-                min_value=1,
-                value=1,
-                help="Use 2 if column names are in row two.",
-            )
+file_key = selection_hash.hexdigest()[:10]
 
-    if not selected_sheets:
-        st.info("Select a sheet in the sidebar.")
-        st.stop()
+frames = {}
 
-    frames = {}
+with st.sidebar:
+    st.caption(f"{len(uploaded_files)} file(s) uploaded")
 
-    for sheet in selected_sheets:
-        if sheet == "CSV" and uploaded.name.lower().endswith(".csv"):
-            frame = pd.read_csv(
-                BytesIO(content),
-                header=header_row - 1,
-                dtype=object,
-            )
-        else:
-            frame = pd.read_excel(
-                BytesIO(content),
-                sheet_name=sheet,
-                header=header_row - 1,
-                dtype=object,
-            )
+    for file_number, uploaded_file in enumerate(uploaded_files, 1):
+        file_content = uploaded_file.getvalue()
 
-        frame.columns = [str(c).strip() for c in frame.columns]
+        individual_key = (
+            f"{file_number}_"
+            f"{hashlib.sha256(file_content).hexdigest()[:10]}"
+        )
 
-        if frame.columns.duplicated().any():
-            raise ValueError(f"Duplicate column names in {sheet}.")
+        with st.expander(
+            f"📁 {uploaded_file.name}",
+            expanded=len(uploaded_files) == 1,
+        ):
+            try:
+                if uploaded_file.name.lower().endswith(".csv"):
+                    header_row = st.number_input(
+                        "Header row",
+                        min_value=1,
+                        value=1,
+                        step=1,
+                        key=f"{individual_key}_csv_header",
+                    )
 
-        frames[sheet] = frame.dropna(how="all")
+                    frame = pd.read_csv(
+                        BytesIO(file_content),
+                        header=header_row - 1,
+                        dtype=object,
+                    )
 
-except Exception as error:
-    st.error(f"Could not read the file: {error}")
+                    frame.columns = [
+                        str(column).strip()
+                        for column in frame.columns
+                    ]
+
+                    if frame.columns.duplicated().any():
+                        raise ValueError(
+                            "Column names must be unique."
+                        )
+
+                    # Unique source label, including file number.
+                    source_label = (
+                        f"{file_number}. {uploaded_file.name}"
+                    )
+
+                    frames[source_label] = frame.dropna(
+                        how="all"
+                    ).reset_index(drop=True)
+
+                else:
+                    workbook = pd.ExcelFile(
+                        BytesIO(file_content)
+                    )
+
+                    selected_sheets = st.multiselect(
+                        "Sheets to use",
+                        workbook.sheet_names,
+                        default=workbook.sheet_names[:2],
+                        key=f"{individual_key}_sheets",
+                    )
+
+                    for sheet_name in selected_sheets:
+                        header_row = st.number_input(
+                            f"Header row: {sheet_name}",
+                            min_value=1,
+                            value=1,
+                            step=1,
+                            key=(
+                                f"{individual_key}_"
+                                f"{sheet_name}_header"
+                            ),
+                        )
+
+                        frame = pd.read_excel(
+                            workbook,
+                            sheet_name=sheet_name,
+                            header=header_row - 1,
+                            dtype=object,
+                        )
+
+                        frame.columns = [
+                            str(column).strip()
+                            for column in frame.columns
+                        ]
+
+                        if frame.columns.duplicated().any():
+                            raise ValueError(
+                                f"Column names must be unique "
+                                f"in sheet '{sheet_name}'."
+                            )
+
+                        source_label = (
+                            f"{file_number}. "
+                            f"{uploaded_file.name} | {sheet_name}"
+                        )
+
+                        frames[source_label] = frame.dropna(
+                            how="all"
+                        ).reset_index(drop=True)
+
+            except Exception as error:
+                st.error(
+                    f"Could not read "
+                    f"{uploaded_file.name}: {error}"
+                )
+                st.stop()
+
+if not frames:
+    st.info("Select at least one sheet from your uploaded files.")
     st.stop()
-
-
 # ---------------------------
 # Simple sidebar configuration
 # ---------------------------
