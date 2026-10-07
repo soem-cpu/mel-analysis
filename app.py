@@ -7,908 +7,705 @@ import streamlit as st
 
 
 st.set_page_config(
-    page_title="M&E Comparison",
+    page_title="M&E Dashboard",
     page_icon="📊",
     layout="wide",
+    initial_sidebar_state="expanded",
 )
 
-st.title("M&E Comparison")
-st.write(
-    "Compare multiple metrics by township, quarter or another "
-    "selected category."
-)
+st.markdown("""
+<style>
+.block-container {padding-top: 2rem;}
+[data-testid="stMetric"] {
+    background: #f0f6fa;
+    padding: 16px;
+    border-radius: 12px;
+}
+</style>
+""", unsafe_allow_html=True)
 
 
-# ===========================
-# HELPER FUNCTIONS
-# ===========================
+# ---------------------------
+# Helpers
+# ---------------------------
 
-DATE_FORMATS = [
-    "Automatic: day first",
-    "Automatic: month first",
-    "YYYY-MM-DD",
-    "DD/MM/YYYY",
-    "MM/DD/YYYY",
-]
-
-
-def clean_frame(frame):
-    frame = frame.copy()
-    frame.columns = [
-        str(column).strip()
-        for column in frame.columns
-    ]
-
-    if not len(frame.columns):
-        raise ValueError("No columns found. Check the header row.")
-
-    if frame.columns.duplicated().any():
-        raise ValueError("Column names must be unique.")
-
-    return frame.dropna(how="all").reset_index(drop=True)
-
-
-def numeric(series):
+def number(series):
     return pd.to_numeric(
-        series.astype("string")
-        .str.strip()
+        series.astype("string").str.strip()
         .str.replace(",", "", regex=False),
         errors="coerce",
     )
 
 
-def parse_dates(series, format_name):
-    formats = {
-        "YYYY-MM-DD": "%Y-%m-%d",
-        "DD/MM/YYYY": "%d/%m/%Y",
-        "MM/DD/YYYY": "%m/%d/%Y",
-    }
+def summarise(data, dimensions, method):
+    grouped = data.groupby(
+        dimensions, dropna=False, sort=False
+    )["Value"]
 
-    if format_name in formats:
-        return pd.to_datetime(
-            series,
-            format=formats[format_name],
-            errors="coerce",
-        )
-
-    return pd.to_datetime(
-        series,
-        format="mixed",
-        errors="coerce",
-        dayfirst=format_name == "Automatic: day first",
+    result = (
+        grouped.sum(min_count=1)
+        if method == "Total"
+        else grouped.mean()
     )
+    return result.reset_index()
 
 
-def download(frame, filename, label, key):
+def download(data, name, key):
     st.download_button(
-        label,
-        data=frame.to_csv(index=False).encode("utf-8-sig"),
-        file_name=filename,
+        "⬇ Download table",
+        data.to_csv(index=False).encode("utf-8-sig"),
+        file_name=name,
         mime="text/csv",
         key=key,
     )
 
 
-def aggregate(frame, dimensions, method):
-    if not dimensions:
-        value = (
-            frame["Value"].sum(min_count=1)
-            if method == "Sum"
-            else frame["Value"].mean()
+def preferred_column(columns, keywords):
+    for keyword in keywords:
+        for index, column in enumerate(columns):
+            if keyword in column.lower():
+                return index + 1
+    return 0
+
+
+def category_order(table, category, metric, direction):
+    ascending = direction == "Smallest first"
+
+    if metric == "Name":
+        return sorted(
+            table[category].unique(),
+            key=lambda item: str(item).casefold(),
+            reverse=direction == "Largest first",
         )
-        return pd.DataFrame({"Value": [value]})
 
-    grouped = frame.groupby(
-        dimensions,
-        dropna=False,
-        sort=False,
-    )["Value"]
+    ranking = (
+        table[table["Metric"] == metric]
+        .set_index(category)["Value"]
+        .sort_values(ascending=ascending)
+    )
+    order = ranking.index.tolist()
+    order += [
+        value for value in table[category].unique()
+        if value not in order
+    ]
+    return order
 
-    result = (
-        grouped.sum(min_count=1)
-        if method == "Sum"
-        else grouped.mean()
+
+# ---------------------------
+# Header and upload
+# ---------------------------
+
+st.title("📊 M&E Dashboard")
+st.caption("Upload your data • Choose metrics • Explore results")
+
+with st.sidebar:
+    st.header("1 · Upload data")
+    uploaded = st.file_uploader(
+        "Excel or CSV file",
+        type=["xlsx", "csv"],
     )
 
-    return result.reset_index()
-
-
-def sort_result(frame, key):
-    first, second = st.columns(2)
-
-    with first:
-        sort_column = st.selectbox(
-            "Sort table by",
-            list(frame.columns),
-            key=f"{key}_column",
-        )
-
-    with second:
-        ascending = st.selectbox(
-            "Table sort direction",
-            ["Ascending", "Descending"],
-            key=f"{key}_direction",
-        ) == "Ascending"
-
-    if pd.api.types.is_numeric_dtype(frame[sort_column]):
-        return frame.sort_values(
-            sort_column,
-            ascending=ascending,
-            kind="stable",
-            na_position="last",
-        ).reset_index(drop=True)
-
-    return frame.sort_values(
-        sort_column,
-        ascending=ascending,
-        kind="stable",
-        na_position="last",
-        key=lambda values: values.astype("string").str.casefold(),
-    ).reset_index(drop=True)
-
-
-# ===========================
-# UPLOAD
-# ===========================
-
-uploaded = st.file_uploader(
-    "Upload Excel or CSV",
-    type=["xlsx", "csv"],
-)
-
 if uploaded is None:
-    st.info("Upload a file to begin.")
+    st.info("👈 Upload an Excel or CSV file in the sidebar.")
+
+    a, b, c = st.columns(3)
+    a.markdown("### 📁 Upload\nUse one or several Excel sheets.")
+    b.markdown("### 🎯 Select\nChoose metrics, township and period.")
+    c.markdown("### 📈 Explore\nView charts, tables and percentages.")
     st.stop()
 
 content = uploaded.getvalue()
-file_id = hashlib.sha256(content).hexdigest()[:12]
+file_key = hashlib.sha256(content).hexdigest()[:10]
 
 try:
-    if uploaded.name.lower().endswith(".csv"):
-        source_frames = {
-            "CSV": clean_frame(
-                pd.read_csv(BytesIO(content), dtype=object)
+    with st.sidebar:
+        if uploaded.name.lower().endswith(".csv"):
+            sheet_names = ["CSV"]
+            selected_sheets = sheet_names
+        else:
+            workbook = pd.ExcelFile(BytesIO(content))
+            sheet_names = workbook.sheet_names
+            selected_sheets = st.multiselect(
+                "Use these sheets",
+                sheet_names,
+                default=sheet_names[:2],
+                key=f"{file_key}_sheets",
             )
-        }
 
-    else:
-        workbook = pd.ExcelFile(BytesIO(content))
-
-        selected_sheets = st.multiselect(
-            "Select sheets containing your metrics",
-            workbook.sheet_names,
-            default=workbook.sheet_names[:2],
-            key=f"{file_id}_sheets",
-        )
-
-        if not selected_sheets:
-            st.info("Select at least one sheet.")
-            st.stop()
-
-        source_frames = {}
-
-        for sheet in selected_sheets:
+        with st.expander("File settings"):
             header_row = st.number_input(
-                f"Header row: {sheet}",
+                "Header row",
                 min_value=1,
                 value=1,
-                step=1,
-                key=f"{file_id}_{sheet}_header",
+                help="Use 2 if column names are in row two.",
             )
 
-            source_frames[sheet] = clean_frame(
-                pd.read_excel(
-                    BytesIO(content),
-                    sheet_name=sheet,
-                    header=header_row - 1,
-                    dtype=object,
-                )
+    if not selected_sheets:
+        st.info("Select a sheet in the sidebar.")
+        st.stop()
+
+    frames = {}
+
+    for sheet in selected_sheets:
+        if sheet == "CSV" and uploaded.name.lower().endswith(".csv"):
+            frame = pd.read_csv(
+                BytesIO(content),
+                header=header_row - 1,
+                dtype=object,
             )
+        else:
+            frame = pd.read_excel(
+                BytesIO(content),
+                sheet_name=sheet,
+                header=header_row - 1,
+                dtype=object,
+            )
+
+        frame.columns = [str(c).strip() for c in frame.columns]
+
+        if frame.columns.duplicated().any():
+            raise ValueError(f"Duplicate column names in {sheet}.")
+
+        frames[sheet] = frame.dropna(how="all")
 
 except Exception as error:
-    st.error(f"Could not read your file: {error}")
+    st.error(f"Could not read the file: {error}")
     st.stop()
 
 
-# ===========================
-# CONFIGURE DATA
-# ===========================
+# ---------------------------
+# Simple sidebar configuration
+# ---------------------------
 
-method = st.selectbox(
-    "Combine metric values using",
-    ["Sum", "Mean"],
-    key=f"{file_id}_aggregation",
-)
+observations = []
+record_count = 0
 
-st.caption(
-    "Use Sum for additive counts or amounts. Mean is an unweighted "
-    "average of valid source values. Analyse compatible units together."
-)
+with st.sidebar:
+    st.header("2 · Select data")
 
-st.subheader("Select metrics and filters")
+    method = st.radio(
+        "Show",
+        ["Total", "Average"],
+        horizontal=True,
+        help="Total adds values. Average uses valid numeric records.",
+    )
 
-st.info(
-    "Give equivalent metrics the same comparison name across sheets. "
-    "For example, use 'People tested' in both sheets. Values with the "
-    "same metric name, group and period will be combined."
-)
+    for sheet, original in frames.items():
+        with st.expander(
+            f"📄 {sheet}",
+            expanded=len(frames) == 1,
+        ):
+            columns = original.columns.tolist()
+            key = f"{file_key}_{sheet}"
 
-long_frames = []
-
-for sheet, original in source_frames.items():
-    with st.expander(f"Data settings: {sheet}", expanded=True):
-        if original.empty:
-            st.warning("This sheet contains no records.")
-            continue
-
-        frame = original.copy()
-        columns = list(frame.columns)
-        prefix = f"{file_id}_{sheet}"
-
-        metrics = st.multiselect(
-            "Select numeric metrics",
-            columns,
-            key=f"{prefix}_metrics",
-        )
-
-        metric_labels = {}
-
-        for metric in metrics:
-            label = st.text_input(
-                f"Comparison name for '{metric}'",
-                value=metric,
-                key=f"{prefix}_label_{metric}",
-            ).strip()
-
-            if not label:
-                st.error("Metric names cannot be blank.")
-                st.stop()
-
-            metric_labels[metric] = label
-
-        if len(set(metric_labels.values())) != len(metric_labels):
-            st.error(
-                "Each selected metric within this sheet "
-                "must have a different comparison name."
+            metrics = st.multiselect(
+                "Metrics to compare",
+                columns,
+                key=f"{key}_metrics",
+                help="Select counts, amounts or scores.",
             )
-            st.stop()
 
-        first, second = st.columns(2)
-
-        with first:
             group_column = st.selectbox(
-                "Township or other group column",
+                "Township / category",
                 ["None"] + columns,
-                key=f"{prefix}_group",
+                index=preferred_column(
+                    columns, ["township", "organization", "gender"]
+                ),
+                key=f"{key}_group",
             )
 
-        with second:
             period_column = st.selectbox(
-                "Quarter, period or date column",
+                "Quarter / period",
                 ["None"] + columns,
-                key=f"{prefix}_period",
+                index=preferred_column(
+                    columns, ["quarter", "month", "year", "date"]
+                ),
+                key=f"{key}_period",
             )
 
-        period_mode = "Labels"
-        parsed_dates = None
-        frequency = "Quarter"
-
-        if period_column != "None":
-            period_mode = st.radio(
-                "Period column contains",
-                ["Labels", "Dates"],
-                horizontal=True,
-                key=f"{prefix}_period_mode",
+            frame = original.copy()
+            period_values = pd.Series(
+                "All periods", index=frame.index, dtype="string"
             )
 
-            if period_mode == "Dates":
-                date_format = st.selectbox(
-                    "Date format",
-                    DATE_FORMATS,
-                    key=f"{prefix}_date_format",
-                )
-
-                frequency = st.selectbox(
-                    "Group dates by",
-                    ["Month", "Quarter", "Year"],
-                    index=1,
-                    key=f"{prefix}_frequency",
-                )
-
-                parsed_dates = parse_dates(
-                    frame[period_column],
-                    date_format,
-                )
-
-                valid_dates = parsed_dates.dropna()
-
-                if valid_dates.empty:
-                    st.warning(
-                        "No valid dates. Check the selected column "
-                        "and date format."
-                    )
-                    continue
-
-                earliest = valid_dates.min().date()
-                latest = valid_dates.max().date()
-
-                selected_range = st.date_input(
-                    "Filter period: start and end",
-                    value=(earliest, latest),
-                    min_value=earliest,
-                    max_value=latest,
-                    key=(
-                        f"{prefix}_range_{period_column}_"
-                        f"{date_format}_{earliest}_{latest}"
-                    ),
-                )
-
-                if len(selected_range) != 2:
-                    st.info("Select start and end dates.")
-                    continue
-
-                start, end = selected_range
-
-                if start > end:
-                    st.error("Start date must be before end date.")
-                    continue
-
-                invalid_count = int(parsed_dates.isna().sum())
-                if invalid_count:
-                    st.caption(
-                        f"{invalid_count:,} missing or invalid "
-                        "dates excluded."
-                    )
-
-                mask = (
-                    parsed_dates.notna()
-                    & (parsed_dates.dt.date >= start)
-                    & (parsed_dates.dt.date <= end)
-                )
-
-                frame = frame.loc[mask].copy()
-
-            else:
+            if period_column != "None":
                 period_values = (
                     frame[period_column].astype("string")
-                    .str.strip()
-                    .replace("", pd.NA)
+                    .str.strip().replace("", pd.NA)
                 )
 
-                options = sorted(
-                    period_values.dropna().unique().tolist()
+                is_date = st.checkbox(
+                    "This column contains full dates",
+                    key=f"{key}_is_date",
                 )
 
-                selected_periods = st.multiselect(
-                    "Periods to include",
-                    options,
-                    default=options,
-                    key=f"{prefix}_period_values",
+                if is_date:
+                    day_first = st.checkbox(
+                        "Day comes before month",
+                        value=True,
+                        key=f"{key}_day_first",
+                    )
+                    frequency = st.selectbox(
+                        "Summarise dates by",
+                        ["Quarter", "Month", "Year"],
+                        key=f"{key}_frequency",
+                    )
+
+                    parsed = pd.to_datetime(
+                        frame[period_column],
+                        format="mixed",
+                        dayfirst=day_first,
+                        errors="coerce",
+                    )
+
+                    code = {
+                        "Quarter": "Q", "Month": "M", "Year": "Y"
+                    }[frequency]
+
+                    period_values = parsed.dt.to_period(code).astype("string")
+                    period_values = period_values.mask(parsed.isna())
+
+                    valid = parsed.dropna()
+
+                    if not valid.empty:
+                        start_limit = valid.min().date()
+                        end_limit = valid.max().date()
+
+                        selected_range = st.date_input(
+                            "Date range",
+                            value=(start_limit, end_limit),
+                            min_value=start_limit,
+                            max_value=end_limit,
+                            key=f"{key}_range_{period_column}_{day_first}",
+                        )
+
+                        if len(selected_range) != 2:
+                            st.info("Select both dates.")
+                            continue
+
+                        start, end = selected_range
+                        if start > end:
+                            st.error("Start date must be before end date.")
+                            continue
+
+                        mask = (
+                            parsed.notna()
+                            & (parsed.dt.date >= start)
+                            & (parsed.dt.date <= end)
+                        )
+                        frame = frame.loc[mask].copy()
+
+                        invalid = int(parsed.isna().sum())
+                        if invalid:
+                            st.caption(
+                                f"{invalid:,} invalid or missing dates excluded."
+                            )
+                    else:
+                        st.warning("No valid dates in this column.")
+                        continue
+
+                choices = sorted(
+                    period_values.loc[frame.index]
+                    .dropna().unique().tolist()
+                )
+                chosen = st.multiselect(
+                    "Periods",
+                    choices,
+                    default=choices,
+                    key=f"{key}_period_filter_{period_column}_{is_date}",
+                )
+                frame = frame.loc[
+                    period_values.loc[frame.index].isin(chosen)
+                ].copy()
+
+            if group_column != "None":
+                group_values = (
+                    frame[group_column].astype("string")
+                    .str.strip().replace("", pd.NA)
+                    .fillna("(Missing)")
+                )
+                choices = sorted(group_values.unique().tolist())
+                chosen = st.multiselect(
+                    "Townships / categories",
+                    choices,
+                    default=choices,
+                    key=f"{key}_group_filter_{group_column}",
+                )
+                frame = frame.loc[group_values.isin(chosen)].copy()
+
+            with st.expander("More options"):
+                extra_filters = st.multiselect(
+                    "Other filters",
+                    columns,
+                    key=f"{key}_other_filters",
                 )
 
-                include_missing_period = st.checkbox(
-                    "Include missing periods",
-                    value=False,
-                    key=f"{prefix}_missing_period",
-                )
+                for column in extra_filters:
+                    values = (
+                        frame[column].astype("string")
+                        .str.strip().replace("", pd.NA)
+                        .fillna("(Missing)")
+                    )
+                    options = sorted(values.unique().tolist())
+                    chosen = st.multiselect(
+                        column,
+                        options,
+                        default=options,
+                        key=f"{key}_extra_{column}",
+                    )
+                    frame = frame.loc[values.isin(chosen)].copy()
 
-                mask = period_values.isin(selected_periods)
+                labels = {}
+                for metric in metrics:
+                    labels[metric] = st.text_input(
+                        f"Display name: {metric}",
+                        value=metric,
+                        key=f"{key}_label_{metric}",
+                    ).strip()
 
-                if include_missing_period:
-                    mask = mask | period_values.isna()
-
-                frame = frame.loc[mask].copy()
-
-        filter_columns = st.multiselect(
-            "Additional filter columns",
-            columns,
-            key=f"{prefix}_filter_columns",
-            help="For example: township, gender, indicator or programme.",
-        )
-
-        for column in filter_columns:
-            values = (
-                frame[column].astype("string")
-                .str.strip()
-                .replace("", pd.NA)
-            )
-
-            options = sorted(
-                values.dropna().unique().tolist()
-            )
-
-            selected_values = st.multiselect(
-                f"Include values: {column}",
-                options,
-                default=options,
-                key=f"{prefix}_filter_{column}",
-            )
-
-            include_missing = st.checkbox(
-                f"Include missing values: {column}",
-                value=True,
-                key=f"{prefix}_missing_{column}",
-            )
-
-            mask = values.isin(selected_values)
-
-            if include_missing:
-                mask = mask | values.isna()
-
-            frame = frame.loc[mask].copy()
-
-        st.caption(f"Filtered records: {len(frame):,}")
-
-        with st.expander("Preview filtered source data"):
-            st.dataframe(
-                frame.head(100),
-                use_container_width=True,
-            )
-
-        download(
-            frame,
-            f"{sheet}_filtered.csv",
-            "Download filtered source data",
-            f"{prefix}_download",
-        )
-
-        if frame.empty or not metrics:
-            continue
-
-        base = pd.DataFrame(index=frame.index)
-
-        if group_column == "None":
-            base["Group"] = "All groups"
-        else:
-            base["Group"] = (
-                frame[group_column].astype("string")
-                .str.strip()
-                .replace("", pd.NA)
-                .fillna("(Missing)")
-            )
-
-        if period_column == "None":
-            base["Period"] = "All periods"
-
-        elif period_mode == "Dates":
-            frequency_code = {
-                "Month": "M",
-                "Quarter": "Q",
-                "Year": "Y",
-            }[frequency]
-
-            base["Period"] = (
-                parsed_dates.loc[frame.index]
-                .dt.to_period(frequency_code)
-                .astype("string")
-            )
-
-        else:
-            base["Period"] = (
-                frame[period_column].astype("string")
-                .str.strip()
-                .replace("", pd.NA)
-                .fillna("(Missing)")
-            )
-
-        for metric in metrics:
-            part = base.copy()
-            part["Metric"] = metric_labels[metric]
-            part["Value"] = numeric(frame[metric])
-
-            invalid_count = int(part["Value"].isna().sum())
-
-            if invalid_count:
                 st.caption(
-                    f"{metric_labels[metric]}: "
-                    f"{invalid_count:,} missing or non-numeric "
-                    "values excluded."
+                    "Use the same display name for equivalent "
+                    "metrics in different sheets."
                 )
 
-            part = part.dropna(subset=["Value"])
+            if any(not label for label in labels.values()):
+                st.error("Metric display names cannot be blank.")
+                continue
 
-            if not part.empty:
-                long_frames.append(part)
+            if len(set(labels.values())) != len(labels):
+                st.error("Use different names for metrics within this sheet.")
+                continue
 
-if not long_frames:
-    st.info("Select metrics containing valid numeric data.")
+            st.caption(f"{len(frame):,} records after filters")
+
+            if not metrics or frame.empty:
+                continue
+
+            record_count += len(frame)
+
+            for metric in metrics:
+                values = number(frame[metric])
+                part = pd.DataFrame(index=frame.index)
+
+                part["Group"] = (
+                    frame[group_column].astype("string")
+                    .str.strip().replace("", pd.NA).fillna("(Missing)")
+                    if group_column != "None"
+                    else "All groups"
+                )
+                part["Period"] = period_values.loc[frame.index]
+                part["Metric"] = labels[metric]
+                part["Value"] = values
+
+                missing = int(values.isna().sum())
+                if missing:
+                    st.caption(
+                        f"{labels[metric]}: {missing:,} non-numeric "
+                        "or missing values excluded."
+                    )
+
+                part = part.dropna(subset=["Value", "Period"])
+                if not part.empty:
+                    observations.append(part)
+
+if not observations:
+    st.info(
+        "👈 Open a sheet under 'Select data', then select "
+        "one or more numeric metrics."
+    )
     st.stop()
 
-# Append metric observations. No ID matching is performed.
-long_data = pd.concat(long_frames, ignore_index=True)
-metric_names = sorted(long_data["Metric"].unique().tolist())
+data = pd.concat(observations, ignore_index=True)
+metric_names = sorted(data["Metric"].unique().tolist())
+
+
+# ---------------------------
+# Main overview
+# ---------------------------
+
+a, b, c = st.columns(3)
+a.metric("Filtered source records", f"{record_count:,}")
+b.metric("Metrics", len(metric_names))
+c.metric("Townships / categories", data["Group"].nunique())
 
 st.caption(
-    "Charts and tables combine selected data by metric, group and "
-    "period. Sheet names are not comparison categories. "
-    "Repeated or overlapping source records remain included."
+    "Equivalent metrics are combined across selected sheets. "
+    "Source records are included as supplied."
 )
 
-chart_tab, table_tab = st.tabs([
-    "Comparison charts",
-    "Tables and percentages",
+chart_tab, table_tab, percent_tab = st.tabs([
+    "📊 Charts", "📋 Tables", "🔢 Percentages"
 ])
 
 
-# ===========================
-# CHARTS
-# ===========================
+# ---------------------------
+# Charts
+# ---------------------------
 
 with chart_tab:
-    chart_metrics = st.multiselect(
-        "Metrics to compare",
+    left, right = st.columns(2)
+
+    with left:
+        category = st.radio(
+            "Compare by",
+            ["Group", "Period"],
+            format_func=lambda x: (
+                "Township / category" if x == "Group"
+                else "Quarter / period"
+            ),
+            horizontal=True,
+        )
+
+    with right:
+        chart_type = st.radio(
+            "Chart",
+            ["Bars", "Trend"],
+            horizontal=True,
+        )
+
+    selected_metrics = st.multiselect(
+        "Show metrics",
         metric_names,
         default=metric_names,
-        key=f"{file_id}_chart_metrics",
+        key=f"{file_key}_visible_metrics",
     )
 
-    chart_dimension = st.selectbox(
-        "Compare by",
-        ["Group", "Period"],
-        format_func=lambda value: {
-            "Group": "Township / selected group",
-            "Period": "Quarter / selected period",
-        }[value],
-        key="chart_dimension",
-    )
+    chart_source = data[data["Metric"].isin(selected_metrics)]
 
-    chart_type = st.selectbox(
-        "Chart type",
-        ["Bar chart", "Line chart"],
-        key="chart_type",
-    )
-
-    selected_data = long_data[
-        long_data["Metric"].isin(chart_metrics)
-    ]
-
-    if selected_data.empty:
-        st.info("Select at least one metric.")
+    if chart_source.empty:
+        st.info("Select a metric to display.")
     else:
-        chart_data = aggregate(
-            selected_data,
-            [chart_dimension, "Metric"],
-            method,
+        chart_data = summarise(
+            chart_source, [category, "Metric"], method
         )
 
-        first, second = st.columns(2)
-
-        with first:
-            sort_options = (
-                ["Name"] + chart_metrics
-            )
-
-            sort_by = st.selectbox(
-                "Sort categories by",
-                sort_options,
-                key=f"{file_id}_chart_sort",
-                help="Select a metric to sort by its numeric result.",
-            )
-
-        with second:
-            ascending = st.selectbox(
-                "Sort direction",
-                ["Ascending", "Descending"],
-                key="chart_direction",
-            ) == "Ascending"
-
-        if sort_by == "Name":
-            category_order = sorted(
-                chart_data[chart_dimension].unique().tolist(),
-                key=lambda value: str(value).casefold(),
-                reverse=not ascending,
-            )
-
-        else:
-            ranking = (
-                chart_data[
-                    chart_data["Metric"] == sort_by
-                ]
-                .set_index(chart_dimension)["Value"]
-                .sort_values(
-                    ascending=ascending,
-                    kind="stable",
+        with st.expander("Sort chart"):
+            a, b = st.columns(2)
+            with a:
+                sort_metric = st.selectbox(
+                    "Sort by",
+                    ["Name"] + selected_metrics,
                 )
-            )
+            with b:
+                direction = st.selectbox(
+                    "Order",
+                    ["Smallest first", "Largest first"],
+                )
 
-            category_order = ranking.index.tolist()
-
-            remaining = [
-                category
-                for category in chart_data[
-                    chart_dimension
-                ].unique()
-                if category not in category_order
-            ]
-
-            category_order += sorted(
-                remaining,
-                key=lambda value: str(value).casefold(),
-            )
-
-        order_map = {
-            category: position
-            for position, category in enumerate(category_order)
-        }
-
-        chart_data["_order"] = (
-            chart_data[chart_dimension].map(order_map)
+        order = category_order(
+            chart_data, category, sort_metric, direction
         )
-
+        ranks = {value: i for i, value in enumerate(order)}
+        chart_data["_order"] = chart_data[category].map(ranks)
         chart_data = chart_data.sort_values(
             ["Metric", "_order"]
         ).drop(columns="_order")
 
-        chart_options = {
-            "data_frame": chart_data,
-            "x": chart_dimension,
-            "y": "Value",
-            "color": "Metric",
-            "category_orders": {
-                chart_dimension: category_order
-            },
-            "labels": {
-                "Group": "Township / group",
+        options = dict(
+            data_frame=chart_data,
+            x=category,
+            y="Value",
+            color="Metric",
+            category_orders={category: order},
+            template="plotly_white",
+            color_discrete_sequence=px.colors.qualitative.Safe,
+            labels={
+                "Group": "Township / category",
                 "Period": "Quarter / period",
+                "Value": method,
             },
-            "title": f"{method} comparison",
-        }
+        )
 
-        if chart_type == "Bar chart":
+        if chart_type == "Bars":
             figure = px.bar(
-                **chart_options,
+                **options,
                 barmode="group",
+                text_auto=".3s",
             )
         else:
-            figure = px.line(
-                **chart_options,
-                markers=True,
-            )
+            figure = px.line(**options, markers=True)
 
         figure.update_xaxes(type="category")
-
-        st.plotly_chart(
-            figure,
-            use_container_width=True,
+        figure.update_layout(
+            height=480,
+            legend_title_text="",
+            margin=dict(t=30, b=30),
         )
+        st.plotly_chart(figure, use_container_width=True)
 
-        st.dataframe(
-            chart_data,
-            use_container_width=True,
-        )
+        if chart_type == "Trend":
+            st.caption(
+                "Use periods such as 2026-01 or 2026Q1 and "
+                "sort by Name, Smallest first for chronological order."
+            )
 
-        download(
-            chart_data,
-            "chart_comparison.csv",
-            "Download chart table",
-            "chart_download",
-        )
-
-        st.caption(
-            "For chronological trends, use periods such as "
-            "2026-01 or 2026Q1 and sort by Name, Ascending."
-        )
+        download(chart_data, "chart_data.csv", "chart_download")
 
 
-# ===========================
-# COMPARISON TABLE
-# ===========================
+# ---------------------------
+# Table configuration
+# ---------------------------
 
 with table_tab:
-    st.subheader("Comparison table")
-
-    table_dimensions = st.multiselect(
-        "Table breakdown",
+    breakdown = st.multiselect(
+        "Break table down by",
         ["Group", "Period"],
         default=["Group", "Period"],
-        format_func=lambda value: {
-            "Group": "Township / selected group",
-            "Period": "Quarter / selected period",
-        }[value],
-        key="table_dimensions",
+        format_func=lambda x: (
+            "Township / category" if x == "Group"
+            else "Quarter / period"
+        ),
     )
 
-    table_metrics = st.multiselect(
-        "Metrics in table",
-        metric_names,
-        default=metric_names,
-        key=f"{file_id}_table_metrics",
+    summary = summarise(
+        data, breakdown + ["Metric"], method
     )
 
-    table_source = long_data[
-        long_data["Metric"].isin(table_metrics)
-    ]
+    # Prefix columns to prevent collisions with Group or Period.
+    summary["Metric column"] = "Metric: " + summary["Metric"]
 
-    if table_source.empty:
-        st.info("Select at least one metric.")
+    if breakdown:
+        table = summary.pivot(
+            index=breakdown,
+            columns="Metric column",
+            values="Value",
+        ).reset_index()
     else:
-        table_long = aggregate(
-            table_source,
-            table_dimensions + ["Metric"],
-            method,
-        )
+        table = pd.DataFrame([{
+            row["Metric column"]: row["Value"]
+            for _, row in summary.iterrows()
+        }])
+        table.insert(0, "Scope", "Overall")
 
-        # Prefix metric columns to avoid collisions with
-        # dimension names such as Group or Period.
-        table_long["Metric column"] = (
-            "Metric: " + table_long["Metric"]
-        )
+    table.columns.name = None
+    st.dataframe(table.round(2), use_container_width=True)
+    st.caption("Click a column heading to sort the displayed table.")
+    download(table, "comparison_table.csv", "table_download")
 
-        if table_dimensions:
-            wide = table_long.pivot(
-                index=table_dimensions,
-                columns="Metric column",
+
+# ---------------------------
+# Percentages
+# ---------------------------
+
+with percent_tab:
+    percent_mode = st.radio(
+        "Calculate",
+        ["One metric ÷ another", "Share of total"],
+        horizontal=True,
+    )
+
+    percent_breakdown = st.multiselect(
+        "Calculate for each",
+        ["Group", "Period"],
+        default=["Group"],
+        format_func=lambda x: (
+            "Township / category" if x == "Group"
+            else "Quarter / period"
+        ),
+        key="percent_breakdown",
+    )
+
+    totals = summarise(
+        data, percent_breakdown + ["Metric"], "Total"
+    )
+
+    if percent_mode == "One metric ÷ another":
+        a, b = st.columns(2)
+        with a:
+            numerator = st.selectbox(
+                "Numerator",
+                metric_names,
+                key=f"{file_key}_numerator",
+            )
+        with b:
+            denominator = st.selectbox(
+                "Denominator",
+                metric_names,
+                key=f"{file_key}_denominator",
+            )
+
+        if percent_breakdown:
+            wide = totals.pivot(
+                index=percent_breakdown,
+                columns="Metric",
                 values="Value",
-            ).reset_index()
+            )
         else:
             wide = pd.DataFrame([{
-                row["Metric column"]: row["Value"]
-                for _, row in table_long.iterrows()
+                row["Metric"]: row["Value"]
+                for _, row in totals.iterrows()
             }])
-            wide.insert(0, "Scope", "Overall")
 
-        wide.columns.name = None
-
-        wide_sorted = sort_result(
-            wide,
-            "comparison_table_sort",
+        result = pd.DataFrame(
+            {
+                "Numerator": wide[numerator],
+                "Denominator": wide[denominator],
+            },
+            index=wide.index,
+        )
+        result["Percent"] = (
+            result["Numerator"]
+            / result["Denominator"].where(result["Denominator"] > 0)
+            * 100
         )
 
-        st.dataframe(
-            wide_sorted.round(2),
-            use_container_width=True,
-        )
-
-        download(
-            wide_sorted,
-            "comparison_table.csv",
-            "Download comparison table",
-            "comparison_table_download",
-        )
-
-
-        # ===========================
-        # PERCENTAGE TABLE
-        # ===========================
-
-        st.subheader("Percentage calculations")
-
-        percent_mode = st.selectbox(
-            "Percentage method",
-            [
-                "Metric divided by another metric",
-                "Share of overall total",
-            ],
-            key="percent_mode",
-        )
-
-        available_metrics = sorted(
-            table_source["Metric"].unique().tolist()
-        )
-
-        if percent_mode == "Metric divided by another metric":
-            first, second = st.columns(2)
-
-            with first:
-                numerator = st.selectbox(
-                    "Numerator metric",
-                    available_metrics,
-                    key=f"{file_id}_numerator",
-                )
-
-            with second:
-                denominator = st.selectbox(
-                    "Denominator metric",
-                    available_metrics,
-                    key=f"{file_id}_denominator",
-                )
-
-            calculation_method = st.selectbox(
-                "Percentage aggregation",
-                ["Ratio of sums", "Ratio of means"],
-                key="percentage_aggregation",
-            )
-
-            percent_aggregate = aggregate(
-                table_source,
-                table_dimensions + ["Metric"],
-                (
-                    "Sum"
-                    if calculation_method == "Ratio of sums"
-                    else "Mean"
-                ),
-            )
-
-            if table_dimensions:
-                percent_wide = percent_aggregate.pivot(
-                    index=table_dimensions,
-                    columns="Metric",
-                    values="Value",
-                )
-            else:
-                percent_wide = pd.DataFrame([{
-                    row["Metric"]: row["Value"]
-                    for _, row in percent_aggregate.iterrows()
-                }])
-
-            # Build output separately so source metric names
-            # cannot overwrite calculation column names.
-            result = pd.DataFrame(
-                {
-                    "Numerator": percent_wide[numerator],
-                    "Denominator": percent_wide[denominator],
-                },
-                index=percent_wide.index,
-            )
-
-            result["Percent"] = (
-                result["Numerator"]
-                / result["Denominator"].where(
-                    result["Denominator"] > 0
-                )
-                * 100
-            )
-
-            if table_dimensions:
-                result = result.reset_index()
-            else:
-                result.insert(0, "Scope", "Overall")
-
-            st.caption(
-                f"Percent = {numerator} ÷ {denominator} × 100. "
-                "Missing or non-positive denominators give blanks. "
-                "Use equivalent populations and periods. "
-                "Ratio of sums is normally appropriate for counts."
-            )
-
+        if percent_breakdown:
+            result = result.reset_index()
         else:
-            selected_metric = st.selectbox(
-                "Metric for share calculation",
-                available_metrics,
-                key=f"{file_id}_share_metric",
-            )
+            result.insert(0, "Scope", "Overall")
 
-            share_source = table_source[
-                table_source["Metric"] == selected_metric
-            ]
-
-            result = aggregate(
-                share_source,
-                table_dimensions,
-                "Sum",
-            ).rename(columns={"Value": "Subtotal"})
-
-            if not table_dimensions:
-                result.insert(0, "Scope", "Overall")
-
-            total = result["Subtotal"].sum(min_count=1)
-            result["Overall total"] = total
-
-            result["Percent"] = (
-                result["Subtotal"] / total * 100
-                if pd.notna(total) and total > 0
-                else float("nan")
-            )
-
-            st.caption(
-                "Percent = category subtotal ÷ overall filtered "
-                "total × 100. This uses sums and is intended "
-                "for non-negative additive counts or amounts."
-            )
-
-        result = sort_result(
-            result,
-            f"percentage_sort_{percent_mode}",
+        st.caption(
+            f"{numerator} ÷ {denominator} × 100, using totals. "
+            "Use metrics covering equivalent populations and periods."
         )
 
-        st.dataframe(
-            result.round(2),
-            use_container_width=True,
+    else:
+        metric = st.selectbox(
+            "Metric",
+            metric_names,
+            key=f"{file_key}_share_metric",
+        )
+        result = totals[totals["Metric"] == metric].drop(
+            columns="Metric"
+        ).rename(columns={"Value": "Subtotal"})
+
+        total = result["Subtotal"].sum(min_count=1)
+        result["Overall total"] = total
+        result["Percent"] = (
+            result["Subtotal"] / total * 100
+            if pd.notna(total) and total > 0
+            else float("nan")
         )
 
-        download(
-            result,
-            "percentage_analysis.csv",
-            "Download percentage table",
-            "percentage_download",
+        if not percent_breakdown:
+            result.insert(0, "Scope", "Overall")
+
+        st.caption(
+            "Category subtotal ÷ overall filtered total × 100. "
+            "Suitable for non-negative additive counts or amounts."
         )
+
+    st.dataframe(result.round(2), use_container_width=True)
+
+    if percent_breakdown:
+        plot_data = result.copy()
+        plot_data["Category"] = (
+            plot_data[percent_breakdown].astype(str)
+            .agg(" | ".join, axis=1)
+        )
+        figure = px.bar(
+            plot_data,
+            x="Category",
+            y="Percent",
+            text_auto=".1f",
+            template="plotly_white",
+            color_discrete_sequence=["#247BA0"],
+        )
+        figure.update_layout(height=350)
+        st.plotly_chart(figure, use_container_width=True)
+
+    download(result, "percentage_table.csv", "percent_download")
+
+    st.caption(
+        "Missing or non-positive denominators produce blank percentages."
+    )
