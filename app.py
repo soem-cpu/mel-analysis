@@ -467,7 +467,7 @@ chart_tab, table_tab = st.tabs([
 
 with chart_tab:
     chart_metrics = st.multiselect(
-        "Metrics to show",
+        "Metrics to compare",
         sorted(metric_names),
         default=sorted(metric_names),
         key="chart_metrics",
@@ -475,7 +475,11 @@ with chart_tab:
 
     chart_dimension = st.selectbox(
         "Compare by",
-        ["Sheet", "Period", "Group"],
+        ["Group", "Period"],
+        format_func=lambda value: {
+            "Group": "Township / selected group",
+            "Period": "Quarter / selected period",
+        }[value],
         key="chart_dimension",
     )
 
@@ -492,18 +496,12 @@ with chart_tab:
     if selected_data.empty:
         st.info("Select at least one metric.")
     else:
-        dimensions = list(dict.fromkeys(
-            [chart_dimension, "Sheet", "Metric"]
-        ))
-
+        # Combine equivalent metrics across selected sheets.
+        # Sheet is not a comparison dimension.
         chart_data = aggregate(
-            selected_data, dimensions, method
-        )
-
-        chart_data["Series"] = (
-            chart_data["Sheet"].astype(str)
-            + " | "
-            + chart_data["Metric"].astype(str)
+            selected_data,
+            [chart_dimension, "Metric"],
+            method,
         )
 
         first, second = st.columns(2)
@@ -529,7 +527,6 @@ with chart_tab:
                 reverse=not ascending,
             )
         else:
-            # Sum series values only to determine display order.
             ranking = (
                 chart_data.groupby(chart_dimension)["Value"]
                 .sum(min_count=1)
@@ -545,37 +542,39 @@ with chart_tab:
         chart_data["_order"] = (
             chart_data[chart_dimension].map(ranks)
         )
+
         chart_data = chart_data.sort_values(
-            ["Series", "_order"]
+            ["Metric", "_order"]
         ).drop(columns="_order")
+
+        chart_options = {
+            "data_frame": chart_data,
+            "x": chart_dimension,
+            "y": "Value",
+            "color": "Metric",
+            "category_orders": {
+                chart_dimension: category_order
+            },
+            "title": f"{method} comparison by {chart_dimension}",
+        }
 
         if chart_type == "Bar chart":
             figure = px.bar(
-                chart_data,
-                x=chart_dimension,
-                y="Value",
-                color="Series",
+                **chart_options,
                 barmode="group",
-                category_orders={
-                    chart_dimension: category_order
-                },
-                title=f"{method} comparison",
             )
         else:
             figure = px.line(
-                chart_data,
-                x=chart_dimension,
-                y="Value",
-                color="Series",
+                **chart_options,
                 markers=True,
-                category_orders={
-                    chart_dimension: category_order
-                },
-                title=f"{method} comparison",
             )
 
         figure.update_xaxes(type="category")
-        st.plotly_chart(figure, use_container_width=True)
+
+        st.plotly_chart(
+            figure,
+            use_container_width=True,
+        )
 
         st.dataframe(
             chart_data,
@@ -587,13 +586,6 @@ with chart_tab:
             "chart_comparison.csv",
             "Download chart table",
             "chart_download",
-        )
-
-        st.caption(
-            "For chronological trends, use consistent labels such "
-            "as 2026-01 and sort Period by Name, Ascending. "
-            "Numeric sorting ranks categories by the sum of displayed "
-            "series values and is suitable for compatible units."
         )
 
 
@@ -622,7 +614,7 @@ with table_tab:
         long_data["Metric"].isin(table_metrics)
     ]
 
-    keys = ["Sheet"] + table_dimensions
+    keys = table_dimensions
 
     if table_source.empty:
         st.info("Select at least one metric.")
@@ -656,8 +648,7 @@ with table_tab:
             "Percentage method",
             [
                 "Metric divided by another metric",
-                "Share of total within each sheet",
-                "Difference between two sheets",
+                "Share of overall total",
             ],
         )
 
@@ -700,44 +691,44 @@ with table_tab:
                 "Both metrics should cover the same population and period."
             )
 
-        elif percent_mode == "Share of total within each sheet":
+        elif percent_mode == "Share of overall total":
             selected_metric = st.selectbox(
                 "Metric for share calculation",
                 available_metrics,
                 key="share_metric",
             )
 
-            # A share is calculated using additive totals,
-            # regardless of the chart aggregation setting.
             share_source = table_source[
                 table_source["Metric"] == selected_metric
             ]
 
-            result = aggregate(
-                share_source,
-                keys,
-                "Sum",
-            ).rename(columns={"Value": "Subtotal"})
+            if keys:
+                result = aggregate(
+                    share_source,
+                    keys,
+                    "Sum",
+                ).rename(columns={"Value": "Subtotal"})
+            else:
+                result = pd.DataFrame({
+                    "Subtotal": [
+                        share_source["Value"].sum(min_count=1)
+                    ]
+                })
 
-            result["Sheet total"] = (
-                result.groupby("Sheet")["Subtotal"]
-                .transform("sum")
-            )
+            total = result["Subtotal"].sum(min_count=1)
+            result["Overall total"] = total
 
             result["Percent"] = (
-                result["Subtotal"]
-                / result["Sheet total"].where(
-                    result["Sheet total"] > 0
-                )
-                * 100
+                result["Subtotal"] / total * 100
+                if pd.notna(total) and total > 0
+                else float("nan")
             )
 
             st.caption(
-                "Percent = subtotal / filtered sheet total × 100. "
-                "This uses sums and is intended for non-negative, "
-                "additive counts or amounts."
+                "Percent = category subtotal / overall filtered "
+                "total × 100. Selected sheets contribute to "
+                "the overall total."
             )
-
         else:
             available_sheets = list(
                 table_source["Sheet"].unique()
@@ -745,103 +736,3 @@ with table_tab:
 
             if len(available_sheets) < 2:
                 st.info(
-                    "Select metrics with valid data in two sheets "
-                    "to calculate a between-sheet difference."
-                )
-                st.stop()
-
-            first, second = st.columns(2)
-
-            with first:
-                baseline_sheet = st.selectbox(
-                    "Baseline sheet",
-                    available_sheets,
-                    key="baseline_sheet",
-                )
-
-            with second:
-                comparison_sheet = st.selectbox(
-                    "Comparison sheet",
-                    [
-                        sheet for sheet in available_sheets
-                        if sheet != baseline_sheet
-                    ],
-                    key="comparison_sheet",
-                )
-
-            # Align aggregated categories and metric names only.
-            # No individual records or UIDs are linked.
-            comparison_keys = table_dimensions + ["Metric"]
-
-            baseline = table_long[
-                table_long["Sheet"] == baseline_sheet
-            ][comparison_keys + ["Value"]].rename(
-                columns={"Value": "Baseline"}
-            )
-
-            comparison = table_long[
-                table_long["Sheet"] == comparison_sheet
-            ][comparison_keys + ["Value"]].rename(
-                columns={"Value": "Comparison"}
-            )
-
-            result = baseline.merge(
-                comparison,
-                on=comparison_keys,
-                how="outer",
-                validate="one_to_one",
-            )
-
-            result["Difference"] = (
-                result["Comparison"] - result["Baseline"]
-            )
-
-            result["Difference (percent)"] = (
-                result["Difference"]
-                / result["Baseline"].where(
-                    result["Baseline"] > 0
-                )
-                * 100
-            )
-
-            st.caption(
-                "Difference = comparison − baseline. "
-                "Difference (percent) = difference / baseline × 100. "
-                "Only equivalent metric names and category labels align. "
-                "Missing or non-positive baselines produce blanks."
-            )
-
-        first, second = st.columns(2)
-
-        with first:
-            sort_column = st.selectbox(
-                "Sort percentage table by",
-                list(result.columns),
-                key=f"percent_sort_{percent_mode}",
-            )
-
-        with second:
-            sort_ascending = st.selectbox(
-                "Percentage table direction",
-                ["Ascending", "Descending"],
-                key=f"percent_direction_{percent_mode}",
-            ) == "Ascending"
-
-        result = result.sort_values(
-            sort_column,
-            ascending=sort_ascending,
-            kind="stable",
-            na_position="last",
-        ).reset_index(drop=True)
-
-        st.dataframe(
-            result.round(2),
-            use_container_width=True,
-        )
-
-        download(
-            result,
-            "percentage_analysis.csv",
-            "Download percentage table",
-            "percentage_download",
-        )
