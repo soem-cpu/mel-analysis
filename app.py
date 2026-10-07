@@ -276,7 +276,7 @@ with st.sidebar:
             )
 
             group_column = st.selectbox(
-                "Township / category",
+                "Category",
                 ["None"] + columns,
                 index=preferred_column(
                     columns, ["township", "organization", "gender"]
@@ -520,7 +520,7 @@ with chart_tab:
             "Compare by",
             ["Group", "Period"],
             format_func=lambda x: (
-                "Township / category" if x == "Group"
+                "Category" if x == "Group"
                 else "Quarter / period"
             ),
             horizontal=True,
@@ -580,7 +580,7 @@ with chart_tab:
             template="plotly_white",
             color_discrete_sequence=px.colors.qualitative.Safe,
             labels={
-                "Group": "Township / category",
+                "Group": "Category",
                 "Period": "Quarter / period",
                 "Value": method,
             },
@@ -622,7 +622,7 @@ with table_tab:
         ["Group", "Period"],
         default=["Group", "Period"],
         format_func=lambda x: (
-            "Township / category" if x == "Group"
+            "Category" if x == "Group"
             else "Quarter / period"
         ),
     )
@@ -743,7 +743,7 @@ with table_tab:
 
         quarter_table.columns.name = None
         quarter_table = quarter_table.rename(
-            columns={"Group": "Township / category"}
+            columns={"Group": "Category"}
         )
 
         first, second = st.columns(2)
@@ -802,12 +802,12 @@ with table_tab:
                 template="plotly_white",
                 category_orders={
                     "Group": quarter_table[
-                        "Township / category"
+                        "Category"
                     ].tolist(),
                     "Period": quarter_order,
                 },
                 labels={
-                    "Group": "Township / category",
+                    "Group": "Category",
                     "Period": "Quarter / period",
                 },
                 title="Performance by category and period",
@@ -847,7 +847,7 @@ with percent_tab:
         ["Group", "Period"],
         default=["Group"],
         format_func=lambda x: (
-            "Township / category" if x == "Group"
+            "Category" if x == "Group"
             else "Quarter / period"
         ),
         key="percent_breakdown",
